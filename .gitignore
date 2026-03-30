@@ -1,0 +1,18 @@
+.idea/
+.DS_Store
+*.log
+bin/
+pkg/
+# temp/editor files
+*~
+*.swp
+
+# Go build
+*.exe
+*.exe~
+
+# Node / other
+node_modules/
+.env
+.env.*
+
