@@ -2,12 +2,27 @@
 BINARY_NAME=audio-scout
 BIN_DIR=bin
 
+# Sentinel file — proves `make init` has been run on this clone.
+# Checked before checks/build so contributors can't accidentally skip it.
+HOOKS_SENTINEL=.git/hooks/.githooks-installed
+
 .PHONY: init checks staticcheck lint test build clean
 
 init:
 	git config core.hooksPath .githooks
+	@touch $(HOOKS_SENTINEL)
+	@echo "✓ Git hooks configured. You're ready to develop."
 
-checks: staticcheck lint test
+# Guard target — aborts with a helpful message if init was never run.
+$(HOOKS_SENTINEL):
+	@echo ""
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "⚠️  Run 'make init' first to configure git hooks."
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo ""
+	@exit 1
+
+checks: $(HOOKS_SENTINEL) staticcheck lint test
 
 staticcheck:
 	staticcheck ./...

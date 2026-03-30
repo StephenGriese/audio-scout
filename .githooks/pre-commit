@@ -1,46 +1,56 @@
 #!/bin/bash
-# Pre-commit hook to run full make checks
+# Pre-commit hook: runs staticcheck, lint (with --fix), and tests.
+# If golangci-lint --fix modifies any tracked files the commit is aborted —
+# the developer must review the fixes, stage them, and commit again.
 
 set -e
 
 echo "🔍 Running pre-commit checks..."
 
-# Capture the current git status before running checks
-# This will show us if any files are modified by the linter
-BEFORE_STATUS=$(git status --porcelain)
-
-# Run full make checks (staticcheck, lint, check-event-ids)
-if ! make checks; then
+# ── staticcheck ────────────────────────────────────────────────────────────────
+if ! make staticcheck; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "❌ Pre-commit checks failed!"
-    echo ""
-    echo "Please fix the issues above before committing."
-    echo "To bypass this check (not recommended), use: git commit --no-verify"
+    echo "❌ staticcheck failed — please fix the issues above before committing."
+    echo "   To bypass (not recommended): git commit --no-verify"
     exit 1
 fi
 
-# Check if any files were modified by the linter
-AFTER_STATUS=$(git status --porcelain)
+# ── golangci-lint --fix ────────────────────────────────────────────────────────
+# Snapshot tracked-file state before lint so we can detect auto-fixes.
+git stash list > /dev/null  # warm the index, no-op
+PRE_LINT=$(git diff --name-only)
 
-if [ "$BEFORE_STATUS" != "$AFTER_STATUS" ]; then
+make lint
+
+# If lint modified any tracked files, abort and ask the developer to stage them.
+POST_LINT=$(git diff --name-only)
+if [ "$PRE_LINT" != "$POST_LINT" ]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "⚠️  Linter modified files during pre-commit check!"
-    echo ""
-    echo "The following files were changed by the linter:"
+    echo "⚠️  golangci-lint --fix modified files that are not staged:"
     echo ""
     git diff --name-only
     echo ""
-    echo "Please review the changes, stage them, and commit again:"
-    echo "  git add <files>"
-    echo "  git commit"
+    echo "Review the changes, stage them, and commit again:"
+    echo "  git diff          # review"
+    echo "  git add -p        # stage selectively, or"
+    echo "  git add .         # stage all"
+    echo "  git commit        # retry"
     echo ""
-    echo "To bypass this check (not recommended), use: git commit --no-verify"
+    echo "To bypass (not recommended): git commit --no-verify"
+    exit 1
+fi
+
+# ── tests ──────────────────────────────────────────────────────────────────────
+if ! make test; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ Tests failed — please fix them before committing."
+    echo "   To bypass (not recommended): git commit --no-verify"
     exit 1
 fi
 
 echo ""
 echo "✓ All pre-commit checks passed!"
 exit 0
-

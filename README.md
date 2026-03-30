@@ -90,6 +90,18 @@ WAITLIST   Watership Down                               Richard Adams           
 
 The tool is silent if there are no results — no output at all, exit 0.
 
+### stderr vs stdout
+
+Progress output (`--verbose`) and error messages go to **stderr**. Results go to **stdout**. These are separate streams, so you can redirect results to a file while still watching progress in your terminal:
+
+```bash
+./bin/audio-scout --goodreads export.csv --verbose > results.txt
+# stderr (progress) prints to your terminal
+# stdout (results) goes to results.txt
+```
+
+This means `--verbose` never pollutes a pipe or redirect — it's safe to always use it for long-running scans.
+
 ### Useful pipes
 
 ```bash
@@ -125,10 +137,13 @@ If you see HTTP 429 responses, lower the rate:
 ## Development
 
 ```bash
+make init     # FIRST: configures git to use .githooks/ (required once per clone)
 make checks   # staticcheck + golangci-lint + tests
 make build    # runs checks, then compiles
 make clean    # remove bin/
 ```
+
+> `make init` only needs to be run once after cloning. It points git at the project's `.githooks/` directory so pre-commit checks run automatically. `make checks` and `make build` will refuse to run until it has been called.
 
 ## License
 
