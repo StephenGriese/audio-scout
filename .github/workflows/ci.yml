@@ -1,4 +1,5 @@
-name: CI
+name: Go CI
+
 on:
   push:
     branches: [ main ]
@@ -6,21 +7,28 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25' # Matching your local toolchain
+          go-version: '1.25'
+          cache: true
 
-      - name: Install Tools
-        run: |
-          go install github.com/PuerkitoBio/goquery
-          go install github.com/riking/staticcheck@latest
-          # Note: If using golangci-lint, it's better to use their official action
+      # This is the specific block to update:
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.6.0
+          # Optional: working-directory: .
+          # args: --timeout=5m
+
+      - name: Install Staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@master
 
       - name: Run Checks
         run: make checks
@@ -28,5 +36,5 @@ jobs:
       - name: Run Tests
         run: make test
 
-      - name: Build
+      - name: Build Binary
         run: make build
