@@ -22,7 +22,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v1.64.5
+          version: 1.64.5
 
       - name: Install Staticcheck
         run: go install honnef.co/go/tools/cmd/staticcheck@master
