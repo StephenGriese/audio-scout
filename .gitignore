@@ -1,19 +1,35 @@
-.DS_Store
-*.log
-bin/
-pkg/
-# IDE settings
-.idea/
-# temp/editor files
-*~
-*.swp
-
-# Go build
+# Binaries for programs and plugins
 *.exe
 *.exe~
+*.dll
+*.so
+*.dylib
+scorpio
 
-# Node / other
-node_modules/
-.env
-.env.*
+# local logging (used in prod)
+*.log
 
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Folders and such
+/vendor
+/target
+
+# Environment config files
+/.env*
+
+# Intellij
+/.idea
+
+# VS Code
+/.vscode
+
+# Mac hidden files
+.DS_Store
+
+# WhiteSource
+/.ws

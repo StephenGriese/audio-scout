@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -51,13 +52,13 @@ type availResponse struct {
 
 // result is a structured result we can print or JSON encode.
 type result struct {
-	Library   string `json:"library"`
-	Found     bool   `json:"found"`
-	Available bool   `json:"available"`
-	Owned     int    `json:"ownedCopies"`
-	AvailableCopies int `json:"availableCopies"`
-	Holds     int    `json:"holdsCount"`
-	Error     string `json:"error,omitempty"`
+	Library         string `json:"library"`
+	Found           bool   `json:"found"`
+	Available       bool   `json:"available"`
+	Owned           int    `json:"ownedCopies"`
+	AvailableCopies int    `json:"availableCopies"`
+	Holds           int    `json:"holdsCount"`
+	Error           string `json:"error,omitempty"`
 }
 
 // doGetWithCtx performs a GET with context and simple retries/backoff.
@@ -83,7 +84,11 @@ func doGetWithCtx(ctx context.Context, client *http.Client, u string) ([]byte, e
 				continue
 			}
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("warning: failed to close response body: %v", err)
+			}
+		}()
 		b, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
 			lastErr = fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))

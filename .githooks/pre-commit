@@ -1,0 +1,46 @@
+#!/bin/bash
+# Pre-commit hook to run full make checks
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# Capture the current git status before running checks
+# This will show us if any files are modified by the linter
+BEFORE_STATUS=$(git status --porcelain)
+
+# Run full make checks (staticcheck, lint, check-event-ids)
+if ! make checks; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ Pre-commit checks failed!"
+    echo ""
+    echo "Please fix the issues above before committing."
+    echo "To bypass this check (not recommended), use: git commit --no-verify"
+    exit 1
+fi
+
+# Check if any files were modified by the linter
+AFTER_STATUS=$(git status --porcelain)
+
+if [ "$BEFORE_STATUS" != "$AFTER_STATUS" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "⚠️  Linter modified files during pre-commit check!"
+    echo ""
+    echo "The following files were changed by the linter:"
+    echo ""
+    git diff --name-only
+    echo ""
+    echo "Please review the changes, stage them, and commit again:"
+    echo "  git add <files>"
+    echo "  git commit"
+    echo ""
+    echo "To bypass this check (not recommended), use: git commit --no-verify"
+    exit 1
+fi
+
+echo ""
+echo "✓ All pre-commit checks passed!"
+exit 0
+
