@@ -27,6 +27,9 @@ jobs:
       - name: Install Staticcheck
         run: go install honnef.co/go/tools/cmd/staticcheck@master
 
+      - name: Initialize Environment
+        run: make init
+
       - name: Run Checks
         run: make checks
 
