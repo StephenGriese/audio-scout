@@ -77,14 +77,15 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 By default, output is plain columnar text — one line per book — designed to be piped:
 
 ```
-AVAILABLE  Dinner for Vampires                          Wil Wheaton                     pittsburgh,freelibrary
-AVAILABLE  The Nightingale                              Kristin Hannah                  chester
-WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent                  pittsburgh,chester,freelibrary
-WAITLIST   Watership Down                               Richard Adams                   chester
+AVAILABLE  Dinner for Vampires                          Wil Wheaton                      312d  pittsburgh,freelibrary
+AVAILABLE  The Nightingale                              Kristin Hannah                   891d  chester
+WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent                  1204d  pittsburgh,chester,freelibrary
+WAITLIST   Watership Down                               Richard Adams                     47d  chester
 ```
 
 - **`AVAILABLE`** — at least one library has a copy ready to borrow right now
 - **`WAITLIST`** — every library that owns it has all copies checked out; you can place a hold
+- **`312d`** — days the book has been on your to-read list (from Goodreads `Date Added`); useful for prioritising long-neglected titles
 - Libraries are collapsed into a single comma-separated column per book — if multiple libraries have it, they all appear on one line
 - Results are sorted: `AVAILABLE` first, then `WAITLIST`
 
@@ -110,6 +111,10 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 
 # Find books by a favourite author
 ./bin/audio-scout --goodreads export.csv --libs pittsburgh | grep "Le Guin"
+
+# Sort by how long the book has been on your list (longest wait first)
+# Column 4 is the days field (numeric, e.g. "1204d") — strip the trailing 'd' for pure numeric sort
+./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | sort -k4 -rn
 
 # Sort alphabetically by title within each status group (already the default)
 ./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | sort -k2

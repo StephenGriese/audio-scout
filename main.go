@@ -26,8 +26,9 @@ type Library struct {
 
 // BookQuery is the title + optional author used to search for a specific audiobook.
 type BookQuery struct {
-	Title  string
-	Author string
+	Title       string
+	Author      string
+	DaysOnList  int // 0 when unknown (e.g. single-book mode)
 }
 
 func (b BookQuery) searchQuery() string {
@@ -220,8 +221,9 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 
 // goodreadsRow holds the fields we care about from the Goodreads CSV export.
 type goodreadsRow struct {
-	Title  string
-	Author string // "First Last" format (column "Author")
+	Title       string
+	Author      string // "First Last" format (column "Author")
+	DaysOnList  int    // days since "Date Added" in the Goodreads export; 0 if unknown
 }
 
 // parseGoodreadsToRead reads a Goodreads library export CSV and returns all
@@ -262,6 +264,10 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 	if !ok {
 		return nil, fmt.Errorf("CSV missing 'Exclusive Shelf' column")
 	}
+	dateAddedIdx := colIdx["Date Added"] // optional; -1 if absent (map returns 0 for missing, but ok handles that)
+	_, hasDateAdded := colIdx["Date Added"]
+
+	today := time.Now().Truncate(24 * time.Hour)
 
 	var books []goodreadsRow
 	for {
@@ -284,7 +290,15 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 		if title == "" {
 			continue
 		}
-		books = append(books, goodreadsRow{Title: title, Author: author})
+		var days int
+		if hasDateAdded && dateAddedIdx < len(rec) {
+			if raw := strings.TrimSpace(rec[dateAddedIdx]); raw != "" {
+				if t, err := time.Parse("2006/01/02", raw); err == nil {
+					days = int(today.Sub(t.Truncate(24 * time.Hour)).Hours() / 24)
+				}
+			}
+		}
+		books = append(books, goodreadsRow{Title: title, Author: author, DaysOnList: days})
 	}
 	return books, nil
 }
@@ -368,10 +382,11 @@ func runGoodreadsMode(
 	// Collect hits and collapse per-library results into one row per book.
 	// A book is AVAILABLE if any library has it now; otherwise WAITLIST.
 	type bookSummary struct {
-		Title     string
-		Author    string
-		Available bool
-		Libraries []string
+		Title       string
+		Author      string
+		Available   bool
+		DaysOnList  int
+		Libraries   []string
 	}
 	type bookKey struct{ Title, Author string }
 	summaries := make(map[bookKey]*bookSummary)
@@ -382,7 +397,7 @@ func runGoodreadsMode(
 		k := bookKey{br.Book.Title, br.Book.Author}
 		s, exists := summaries[k]
 		if !exists {
-			s = &bookSummary{Title: br.Book.Title, Author: br.Book.Author}
+			s = &bookSummary{Title: br.Book.Title, Author: br.Book.Author, DaysOnList: br.Book.DaysOnList}
 			summaries[k] = s
 			order = append(order, k)
 		}
@@ -426,10 +441,15 @@ func runGoodreadsMode(
 			status = "AVAILABLE"
 		}
 		libs := strings.Join(s.Libraries, ",")
-		fmt.Printf("%-9s  %-40s  %-30s  %s\n",
+		days := ""
+		if s.DaysOnList > 0 {
+			days = fmt.Sprintf("%dd", s.DaysOnList)
+		}
+		fmt.Printf("%-9s  %-40s  %-30s  %5s  %s\n",
 			status,
 			truncate(s.Title, 40),
 			truncate(s.Author, 30),
+			days,
 			libs,
 		)
 	}
