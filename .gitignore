@@ -2,6 +2,8 @@
 *.log
 bin/
 pkg/
+# IDE settings
+.idea/
 # temp/editor files
 *~
 *.swp
