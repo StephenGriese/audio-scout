@@ -74,13 +74,19 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 
 ## Output
 
-By default, output is plain columnar text — one line per hit — designed to be piped:
+By default, output is plain columnar text — one line per book — designed to be piped:
 
 ```
-  Fahrenheit 451                                      pittsburgh     AVAILABLE NOW       (owned: 3, available: 1, holds: 2)
-  The Nightingale                                     freelibrary    AVAILABLE NOW       (owned: 5, available: 2, holds: 0)
-  Watership Down                                      chester        Reserve (waitlist)  (owned: 2, available: 0, holds: 7)
+AVAILABLE  Dinner for Vampires                          Wil Wheaton                     pittsburgh,freelibrary
+AVAILABLE  The Nightingale                              Kristin Hannah                  chester
+WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent                  pittsburgh,chester,freelibrary
+WAITLIST   Watership Down                               Richard Adams                   chester
 ```
+
+- **`AVAILABLE`** — at least one library has a copy ready to borrow right now
+- **`WAITLIST`** — every library that owns it has all copies checked out; you can place a hold
+- Libraries are collapsed into a single comma-separated column per book — if multiple libraries have it, they all appear on one line
+- Results are sorted: `AVAILABLE` first, then `WAITLIST`
 
 The tool is silent if there are no results — no output at all, exit 0.
 
@@ -88,16 +94,19 @@ The tool is silent if there are no results — no output at all, exit 0.
 
 ```bash
 # Only books available right now
-./bin/audio-scout --goodreads export.csv --libs pittsburgh | grep "AVAILABLE NOW"
+./bin/audio-scout --goodreads export.csv --libs pittsburgh | grep "^AVAILABLE"
 
-# Sort by library
+# Find books by a favourite author
+./bin/audio-scout --goodreads export.csv --libs pittsburgh | grep "Le Guin"
+
+# Sort alphabetically by title within each status group (already the default)
 ./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | sort -k2
 
-# Count hits per library
-./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | awk '{print $2}' | sort | uniq -c
+# Count hits per status
+./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | awk '{print $1}' | sort | uniq -c
 
 # JSON output piped to jq
-./bin/audio-scout --goodreads export.csv --json | jq '.[] | select(.available == true) | .Book.Title'
+./bin/audio-scout --goodreads export.csv --json | jq '.[] | select(.Available) | .Title'
 
 # Save results to a file; hits and progress stream to stderr so you can watch
 ./bin/audio-scout --goodreads export.csv --verbose > results.txt

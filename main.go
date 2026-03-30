@@ -344,9 +344,9 @@ func runGoodreadsMode(
 				br.Holds = av.HoldsCount
 				resCh <- br
 				if verbose {
-					status := "reservable"
+					status := "WAITLIST"
 					if br.Available {
-						status = "AVAILABLE NOW"
+						status = "AVAILABLE"
 					}
 					fmt.Fprintf(os.Stderr, "  [hit] %s @ %s — %s\n", truncate(b.Title, 50), l.Name, status)
 				}
@@ -365,36 +365,72 @@ func runGoodreadsMode(
 	wg.Wait()
 	close(resCh)
 
-	var hits []bookResult
+	// Collect hits and collapse per-library results into one row per book.
+	// A book is AVAILABLE if any library has it now; otherwise WAITLIST.
+	type bookSummary struct {
+		Title     string
+		Author    string
+		Available bool
+		Libraries []string
+	}
+	type bookKey struct{ Title, Author string }
+	summaries := make(map[bookKey]*bookSummary)
+	// preserve insertion order
+	var order []bookKey
+
 	for br := range resCh {
-		hits = append(hits, br)
+		k := bookKey{br.Book.Title, br.Book.Author}
+		s, exists := summaries[k]
+		if !exists {
+			s = &bookSummary{Title: br.Book.Title, Author: br.Book.Author}
+			summaries[k] = s
+			order = append(order, k)
+		}
+		s.Libraries = append(s.Libraries, br.Library)
+		if br.Available {
+			s.Available = true
+		}
 	}
 
-	if len(hits) == 0 {
-		fmt.Println("No to-read audiobooks are currently available or reservable at the specified libraries.")
+	if len(summaries) == 0 {
+		fmt.Fprintln(os.Stderr, "No to-read audiobooks are currently available or reservable at the specified libraries.")
 		return
 	}
 
 	if outJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(hits)
+		out := make([]bookSummary, 0, len(order))
+		for _, k := range order {
+			out = append(out, *summaries[k])
+		}
+		_ = enc.Encode(out)
 		return
 	}
 
-	fmt.Printf("Audiobook availability for your to-read list:\n\n")
-	for _, br := range hits {
-		status := "Reserve (waitlist)"
-		if br.Available {
-			status = "AVAILABLE NOW"
+	// Sort: AVAILABLE first, then WAITLIST; alphabetical by title within each group.
+	avail := make([]*bookSummary, 0, len(order))
+	wait := make([]*bookSummary, 0, len(order))
+	for _, k := range order {
+		s := summaries[k]
+		if s.Available {
+			avail = append(avail, s)
+		} else {
+			wait = append(wait, s)
 		}
-		fmt.Printf("  %-50s  %-45s  %s  (owned: %d, available: %d, holds: %d)\n",
-			truncate(br.Book.Title, 50),
-			br.Library,
+	}
+
+	for _, s := range append(avail, wait...) {
+		status := "WAITLIST "
+		if s.Available {
+			status = "AVAILABLE"
+		}
+		libs := strings.Join(s.Libraries, ",")
+		fmt.Printf("%-9s  %-40s  %-30s  %s\n",
 			status,
-			br.Owned,
-			br.AvailableCopies,
-			br.Holds,
+			truncate(s.Title, 40),
+			truncate(s.Author, 30),
+			libs,
 		)
 	}
 }
