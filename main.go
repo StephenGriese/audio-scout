@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	_ "github.com/PuerkitoBio/goquery"
 	"io"
 	"log"
 	"net/http"

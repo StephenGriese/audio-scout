@@ -147,5 +147,5 @@ make clean    # remove bin/
 
 ## License
 
-MIT
+MIT - Normal for hobby projects
 
