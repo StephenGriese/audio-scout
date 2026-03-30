@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,11 +63,42 @@ type result struct {
 	Error           string `json:"error,omitempty"`
 }
 
-// doGetWithCtx performs a GET with context and simple retries/backoff.
-func doGetWithCtx(ctx context.Context, client *http.Client, u string) ([]byte, error) {
+// newRateLimiter returns a channel that emits a token every (1/rps) duration.
+// Callers block on receiving from it before making an HTTP request.
+// Close the returned stop channel to shut down the background goroutine.
+func newRateLimiter(rps int) (tokens <-chan struct{}, stop chan struct{}) {
+	ch := make(chan struct{}, rps) // small buffer so bursts don't stall
+	stopCh := make(chan struct{})
+	interval := time.Second / time.Duration(rps)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				select {
+				case ch <- struct{}{}:
+				default: // bucket full, drop token
+				}
+			}
+		}
+	}()
+	return ch, stopCh
+}
+
+// doGetWithCtx performs a GET with context, rate-limiting, and simple retries/backoff.
+func doGetWithCtx(ctx context.Context, client *http.Client, limiter <-chan struct{}, u string) ([]byte, error) {
 	var lastErr error
 	// simple retry loop
 	for attempt := 0; attempt < 3; attempt++ {
+		// Wait for a rate-limit token before firing the request.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-limiter:
+		}
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
 			return nil, err
@@ -109,8 +142,8 @@ func doGetWithCtx(ctx context.Context, client *http.Client, u string) ([]byte, e
 }
 
 // getJSONWithCtx is a convenience wrapper to GET and unmarshal JSON with context/retries.
-func getJSONWithCtx(ctx context.Context, client *http.Client, u string, out any) error {
-	b, err := doGetWithCtx(ctx, client, u)
+func getJSONWithCtx(ctx context.Context, client *http.Client, limiter <-chan struct{}, u string, out any) error {
+	b, err := doGetWithCtx(ctx, client, limiter, u)
 	if err != nil {
 		return err
 	}
@@ -127,12 +160,12 @@ type mediaDetail struct {
 }
 
 // checkLibby returns the availability of the first audiobook result matching book at lib.
-func checkLibby(ctx context.Context, client *http.Client, lib Library, book BookQuery) (availResponse, error) {
+func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{}, lib Library, book BookQuery) (availResponse, error) {
 	var empty availResponse
 	// Search for several results so we can prefer audiobook-format entries.
 	searchURL := fmt.Sprintf("https://thunder.api.overdrive.com/v2/libraries/%s/media?query=%s&perPage=20", lib.Key, book.searchQuery())
 	var sr searchResponse
-	if err := getJSONWithCtx(ctx, client, searchURL, &sr); err != nil {
+	if err := getJSONWithCtx(ctx, client, limiter, searchURL, &sr); err != nil {
 		return empty, fmt.Errorf("search request: %w", err)
 	}
 	if len(sr.Items) == 0 {
@@ -141,11 +174,16 @@ func checkLibby(ctx context.Context, client *http.Client, lib Library, book Book
 
 	// Prefer an item that is an audiobook. We'll fetch each item's media detail and
 	// choose the first where mediaType == "audiobook" or one of the formats contains "audiobook".
+	// Cap at 5 detail lookups to avoid hammering the API for every search result.
+	const maxDetailLookups = 5
 	var titleID string
-	for _, item := range sr.Items {
+	for i, item := range sr.Items {
+		if i >= maxDetailLookups {
+			break
+		}
 		var md mediaDetail
 		detailURL := fmt.Sprintf("https://thunder.api.overdrive.com/v2/libraries/%s/media/%s", lib.Key, item.ID)
-		if err := getJSONWithCtx(ctx, client, detailURL, &md); err != nil {
+		if err := getJSONWithCtx(ctx, client, limiter, detailURL, &md); err != nil {
 			// ignore detail parse errors and try next
 			continue
 		}
@@ -169,7 +207,7 @@ func checkLibby(ctx context.Context, client *http.Client, lib Library, book Book
 	}
 
 	availURL := fmt.Sprintf("https://thunder.api.overdrive.com/v2/libraries/%s/media/%s/availability", lib.Key, titleID)
-	body2, err := doGetWithCtx(ctx, client, availURL)
+	body2, err := doGetWithCtx(ctx, client, limiter, availURL)
 	if err != nil {
 		return empty, fmt.Errorf("availability request: %w", err)
 	}
@@ -180,6 +218,196 @@ func checkLibby(ctx context.Context, client *http.Client, lib Library, book Book
 	return av, nil
 }
 
+// goodreadsRow holds the fields we care about from the Goodreads CSV export.
+type goodreadsRow struct {
+	Title  string
+	Author string // "First Last" format (column "Author")
+}
+
+// parseGoodreadsToRead reads a Goodreads library export CSV and returns all
+// books whose "Exclusive Shelf" column equals "to-read".
+func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("warning: failed to close goodreads file: %v", cerr)
+		}
+	}()
+
+	r := csv.NewReader(f)
+	r.LazyQuotes = true
+
+	// Read header row to find column indices by name.
+	header, err := r.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
+	}
+	colIdx := make(map[string]int, len(header))
+	for i, h := range header {
+		colIdx[strings.TrimSpace(h)] = i
+	}
+
+	titleIdx, ok := colIdx["Title"]
+	if !ok {
+		return nil, fmt.Errorf("CSV missing 'Title' column")
+	}
+	authorIdx, ok := colIdx["Author"]
+	if !ok {
+		return nil, fmt.Errorf("CSV missing 'Author' column")
+	}
+	shelfIdx, ok := colIdx["Exclusive Shelf"]
+	if !ok {
+		return nil, fmt.Errorf("CSV missing 'Exclusive Shelf' column")
+	}
+
+	var books []goodreadsRow
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// Skip malformed rows.
+			continue
+		}
+		if len(rec) <= shelfIdx {
+			continue
+		}
+		if strings.TrimSpace(rec[shelfIdx]) != "to-read" {
+			continue
+		}
+		title := strings.TrimSpace(rec[titleIdx])
+		author := strings.TrimSpace(rec[authorIdx])
+		if title == "" {
+			continue
+		}
+		books = append(books, goodreadsRow{Title: title, Author: author})
+	}
+	return books, nil
+}
+
+// bookResult pairs a BookQuery with a per-library result.
+type bookResult struct {
+	Book    BookQuery
+	Library string
+	result
+}
+
+// runGoodreadsMode checks every to-read book across all libraries concurrently,
+// printing only books that are available now or reservable (owned but no
+// available copies — meaning you can place a hold).
+func runGoodreadsMode(
+	ctx context.Context,
+	client *http.Client,
+	limiter <-chan struct{},
+	books []goodreadsRow,
+	libraries []Library,
+	parallel int,
+	outJSON bool,
+	verbose bool,
+) {
+	total := len(books)
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	var completed atomic.Int64
+	resCh := make(chan bookResult, total*len(libraries))
+
+	for _, row := range books {
+		bq := BookQuery(row)
+		for _, lib := range libraries {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(b BookQuery, l Library) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				br := bookResult{Book: b, Library: l.Name}
+				br.result.Library = l.Name
+				av, err := checkLibby(ctx, client, limiter, l, b)
+				if err != nil {
+					// Not found or no audiobook edition — silently skip.
+					return
+				}
+				// Only report if available NOW or reservable (library owns
+				// copies but they're all checked out → holds queue open).
+				reservable := av.OwnedCopies > 0 && !av.IsAvailable
+				if !av.IsAvailable && !reservable {
+					return
+				}
+				br.Found = true
+				br.Available = av.IsAvailable
+				br.Owned = av.OwnedCopies
+				br.AvailableCopies = av.AvailableCopies
+				br.Holds = av.HoldsCount
+				resCh <- br
+				if verbose {
+					status := "reservable"
+					if br.Available {
+						status = "AVAILABLE NOW"
+					}
+					fmt.Fprintf(os.Stderr, "  [hit] %s @ %s — %s\n", truncate(b.Title, 50), l.Name, status)
+				}
+			}(bq, lib)
+		}
+
+		// Progress tick: once per book (after dispatching all library goroutines
+		// for that book) so the counter reflects books dispatched, not completed.
+		// We use a separate goroutine-safe counter on completion instead.
+		n := completed.Add(1)
+		if verbose && n%10 == 0 {
+			fmt.Fprintf(os.Stderr, "  [progress] %d / %d books dispatched...\n", n, total)
+		}
+	}
+
+	wg.Wait()
+	close(resCh)
+
+	var hits []bookResult
+	for br := range resCh {
+		hits = append(hits, br)
+	}
+
+	if len(hits) == 0 {
+		fmt.Println("No to-read audiobooks are currently available or reservable at the specified libraries.")
+		return
+	}
+
+	if outJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(hits)
+		return
+	}
+
+	fmt.Printf("Audiobook availability for your to-read list:\n\n")
+	for _, br := range hits {
+		status := "Reserve (waitlist)"
+		if br.Available {
+			status = "AVAILABLE NOW"
+		}
+		fmt.Printf("  %-50s  %-45s  %s  (owned: %d, available: %d, holds: %d)\n",
+			truncate(br.Book.Title, 50),
+			br.Library,
+			status,
+			br.Owned,
+			br.AvailableCopies,
+			br.Holds,
+		)
+	}
+}
+
+// truncate shortens s to at most n runes, appending "…" if trimmed.
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n-1]) + "…"
+}
+
 func main() {
 	// Flags
 	title := flag.String("title", "Lore", "Book title to search for")
@@ -188,6 +416,9 @@ func main() {
 	outJSON := flag.Bool("json", false, "Output results as JSON")
 	timeoutSec := flag.Int("timeout", 5, "Per-request timeout in seconds")
 	parallel := flag.Int("parallel", 4, "Number of concurrent requests")
+	ratePerSec := flag.Int("rate", 5, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
+	goodreadsFile := flag.String("goodreads", "", "Path to a Goodreads library export CSV; checks all to-read books")
+	verbose := flag.Bool("verbose", false, "Print progress information to stderr")
 	flag.Parse()
 
 	// Build library list
@@ -202,10 +433,27 @@ func main() {
 		libraries = append(libraries, Library{Name: t, Key: t})
 	}
 
-	book := BookQuery{Title: *title, Author: *author}
-
 	ctx := context.Background()
 	client := &http.Client{Timeout: time.Duration(*timeoutSec) * time.Second}
+
+	// Shared rate limiter — all goroutines draw from the same token bucket.
+	limiter, stopLimiter := newRateLimiter(*ratePerSec)
+	defer close(stopLimiter)
+
+	// --goodreads mode: scan every to-read book across all libraries.
+	if *goodreadsFile != "" {
+		books, err := parseGoodreadsToRead(*goodreadsFile)
+		if err != nil {
+			log.Fatalf("Error reading Goodreads export: %v", err)
+		}
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "Found %d to-read books in %s\n", len(books), *goodreadsFile)
+		}
+		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *verbose)
+		return
+	}
+
+	book := BookQuery{Title: *title, Author: *author}
 
 	sem := make(chan struct{}, *parallel)
 	var wg sync.WaitGroup
@@ -218,7 +466,7 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			r := result{Library: l.Name}
-			av, err := checkLibby(ctx, client, l, book)
+			av, err := checkLibby(ctx, client, limiter, l, book)
 			if err != nil {
 				r.Error = err.Error()
 				r.Found = false
