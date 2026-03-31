@@ -446,9 +446,9 @@ func runGoodreadsMode(
 		if s.DaysOnList > 0 {
 			days = fmt.Sprintf("%dd", s.DaysOnList)
 		}
-		fmt.Printf("%-9s  %-40s  %-30s  %5s  %s\n",
+		fmt.Printf("%-9s  %-55s  %-30s  %5s  %s\n",
 			status,
-			truncate(s.Title, 40),
+			truncate(s.Title, 55),
 			truncate(s.Author, 30),
 			days,
 			libs,
