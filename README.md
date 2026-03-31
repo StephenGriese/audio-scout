@@ -51,12 +51,17 @@ Alternatively, open [libbyapp.com](https://libbyapp.com) in your browser, sign i
 Export your library from Goodreads (**My Books → Import and Export → Export Library**), then:
 
 ```bash
-./bin/audio-scout \
-  --goodreads goodreads_library_export.csv \
-  --libs pittsburgh,chester,freelibrary
+time ./bin/audio-scout \
+  --goodreads testdata/goodreads_library_export.csv \
+  --libs pittsburgh,chester,freelibrary \
+  --rate 20 \
+  --parallel 8 \
+  --timeout 15 \
+  --verbose \
+  > available.txt
 ```
 
-Only books on your **to-read** shelf are checked. Books with no audiobook edition, or where the library doesn't own a copy, produce no output.
+Only books on your **to-read** shelf are checked. Books with no audiobook edition, or where the library doesn't own a copy, produce no output. Progress and any warnings stream to stderr so you can watch the run while stdout goes cleanly to the file. Prepending `time` gives you a wall-clock summary when it finishes.
 
 ## Flags
 
@@ -66,9 +71,9 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 | `--author` | `"Alexandra Bracken"` | Author name (single-book mode, optional) |
 | `--libs` | `pittsburgh,chester,freelibrary` | Comma-separated library keys |
 | `--goodreads` | _(none)_ | Path to a Goodreads CSV export; checks all to-read books |
-| `--rate` | `5` | Max HTTP requests per second toward the Thunder API |
-| `--parallel` | `4` | Number of concurrent worker goroutines |
-| `--timeout` | `5` | Per-request HTTP timeout in seconds |
+| `--rate` | `20` | Max HTTP requests per second toward the Thunder API |
+| `--parallel` | `8` | Number of concurrent worker goroutines |
+| `--timeout` | `15` | Per-request HTTP timeout in seconds |
 | `--json` | `false` | Emit results as JSON instead of plain text |
 | `--verbose` | `false` | Print progress and hits to stderr while running |
 
@@ -77,14 +82,15 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 By default, output is plain columnar text — one line per book — designed to be piped:
 
 ```
-AVAILABLE  Dinner for Vampires                          Wil Wheaton                     pittsburgh,freelibrary
-AVAILABLE  The Nightingale                              Kristin Hannah                  chester
-WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent                  pittsburgh,chester,freelibrary
-WAITLIST   Watership Down                               Richard Adams                   chester
+AVAILABLE  Dinner for Vampires                          Wil Wheaton                      312d  pittsburgh,freelibrary
+AVAILABLE  The Nightingale                              Kristin Hannah                   891d  chester
+WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent                  1204d  pittsburgh,chester,freelibrary
+WAITLIST   Watership Down                               Richard Adams                     47d  chester
 ```
 
 - **`AVAILABLE`** — at least one library has a copy ready to borrow right now
 - **`WAITLIST`** — every library that owns it has all copies checked out; you can place a hold
+- **`312d`** — days the book has been on your to-read list (from Goodreads `Date Added`); useful for prioritising long-neglected titles
 - Libraries are collapsed into a single comma-separated column per book — if multiple libraries have it, they all appear on one line
 - Results are sorted: `AVAILABLE` first, then `WAITLIST`
 
@@ -111,6 +117,10 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 # Find books by a favourite author
 ./bin/audio-scout --goodreads export.csv --libs pittsburgh | grep "Le Guin"
 
+# Sort by how long the book has been on your list (longest wait first)
+# Column 4 is the days field (numeric, e.g. "1204d") — strip the trailing 'd' for pure numeric sort
+./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | sort -k4 -rn
+
 # Sort alphabetically by title within each status group (already the default)
 ./bin/audio-scout --goodreads export.csv --libs pittsburgh,chester | sort -k2
 
@@ -126,9 +136,15 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 
 ## Rate limiting
 
-The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **30–50 minutes** at this rate.
+The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **3–4 minutes** at this rate.
 
-If you see HTTP 429 responses, lower the rate:
+If the Thunder API rate-limits you, a warning is printed to **stderr**:
+
+```
+warning: rate-limited (HTTP 429) by Thunder API — consider lowering --rate (attempt 1)
+```
+
+The request will be retried automatically with backoff, but if you see many of these, lower the rate:
 
 ```bash
 ./bin/audio-scout --goodreads export.csv --rate 3

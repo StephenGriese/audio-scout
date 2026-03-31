@@ -18,6 +18,7 @@ scorpio
 # Folders and such
 /vendor
 /target
+/bin
 
 # Environment config files
 /.env*

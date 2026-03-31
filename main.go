@@ -27,8 +27,9 @@ type Library struct {
 
 // BookQuery is the title + optional author used to search for a specific audiobook.
 type BookQuery struct {
-	Title  string
-	Author string
+	Title       string
+	Author      string
+	DaysOnList  int // 0 when unknown (e.g. single-book mode)
 }
 
 func (b BookQuery) searchQuery() string {
@@ -126,11 +127,17 @@ func doGetWithCtx(ctx context.Context, client *http.Client, limiter <-chan struc
 		b, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
 			lastErr = fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+			if resp.StatusCode == http.StatusTooManyRequests {
+				backoff := time.Duration(attempt+1) * 5 * time.Second
+				log.Printf("warning: rate-limited (HTTP 429) by Thunder API — backing off %s (attempt %d/3), consider lowering --rate", backoff, attempt+1)
+				time.Sleep(backoff)
+			} else {
+				time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			default:
-				time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
 				continue
 			}
 		}
@@ -221,8 +228,9 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 
 // goodreadsRow holds the fields we care about from the Goodreads CSV export.
 type goodreadsRow struct {
-	Title  string
-	Author string // "First Last" format (column "Author")
+	Title       string
+	Author      string // "First Last" format (column "Author")
+	DaysOnList  int    // days since "Date Added" in the Goodreads export; 0 if unknown
 }
 
 // parseGoodreadsToRead reads a Goodreads library export CSV and returns all
@@ -263,29 +271,74 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 	if !ok {
 		return nil, fmt.Errorf("CSV missing 'Exclusive Shelf' column")
 	}
+	dateAddedIdx := colIdx["Date Added"] // optional
+	_, hasDateAdded := colIdx["Date Added"]
 
-	var books []goodreadsRow
+	today := time.Now().Truncate(24 * time.Hour)
+
+	// First pass: collect every title+author the user has already read.
+	// We'll skip these even if they also appear on to-read (e.g. a book
+	// exported twice with different shelf values).
+	alreadyRead := make(map[string]struct{})
+	type rawRow struct {
+		title     string
+		author    string
+		shelf     string
+		dateAdded string
+	}
+	var allRows []rawRow
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			// Skip malformed rows.
-			continue
+			continue // skip malformed rows
 		}
 		if len(rec) <= shelfIdx {
 			continue
 		}
-		if strings.TrimSpace(rec[shelfIdx]) != "to-read" {
-			continue
-		}
 		title := strings.TrimSpace(rec[titleIdx])
 		author := strings.TrimSpace(rec[authorIdx])
+		shelf := strings.TrimSpace(rec[shelfIdx])
+		var dateAdded string
+		if hasDateAdded && dateAddedIdx < len(rec) {
+			dateAdded = strings.TrimSpace(rec[dateAddedIdx])
+		}
 		if title == "" {
 			continue
 		}
-		books = append(books, goodreadsRow{Title: title, Author: author})
+		allRows = append(allRows, rawRow{title, author, shelf, dateAdded})
+		if shelf == "read" {
+			key := strings.ToLower(title) + "\x00" + strings.ToLower(author)
+			alreadyRead[key] = struct{}{}
+		}
+	}
+
+	// Second pass: collect to-read books, skipping anything already read
+	// and deduplicating within the to-read set itself.
+	seen := make(map[string]struct{})
+	var books []goodreadsRow
+	for _, row := range allRows {
+		if row.shelf != "to-read" {
+			continue
+		}
+		key := strings.ToLower(row.title) + "\x00" + strings.ToLower(row.author)
+		if _, done := alreadyRead[key]; done {
+			log.Printf("skipping %q — already marked as read", row.title)
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		var days int
+		if row.dateAdded != "" {
+			if t, err := time.Parse("2006/01/02", row.dateAdded); err == nil {
+				days = int(today.Sub(t.Truncate(24 * time.Hour)).Hours() / 24)
+			}
+		}
+		books = append(books, goodreadsRow{Title: row.title, Author: row.author, DaysOnList: days})
 	}
 	return books, nil
 }
@@ -369,10 +422,11 @@ func runGoodreadsMode(
 	// Collect hits and collapse per-library results into one row per book.
 	// A book is AVAILABLE if any library has it now; otherwise WAITLIST.
 	type bookSummary struct {
-		Title     string
-		Author    string
-		Available bool
-		Libraries []string
+		Title       string
+		Author      string
+		Available   bool
+		DaysOnList  int
+		Libraries   []string
 	}
 	type bookKey struct{ Title, Author string }
 	summaries := make(map[bookKey]*bookSummary)
@@ -383,7 +437,7 @@ func runGoodreadsMode(
 		k := bookKey{br.Book.Title, br.Book.Author}
 		s, exists := summaries[k]
 		if !exists {
-			s = &bookSummary{Title: br.Book.Title, Author: br.Book.Author}
+			s = &bookSummary{Title: br.Book.Title, Author: br.Book.Author, DaysOnList: br.Book.DaysOnList}
 			summaries[k] = s
 			order = append(order, k)
 		}
@@ -427,10 +481,15 @@ func runGoodreadsMode(
 			status = "AVAILABLE"
 		}
 		libs := strings.Join(s.Libraries, ",")
-		fmt.Printf("%-9s  %-40s  %-30s  %s\n",
+		days := ""
+		if s.DaysOnList > 0 {
+			days = fmt.Sprintf("%dd", s.DaysOnList)
+		}
+		fmt.Printf("%-9s  %-55s  %-30s  %5s  %s\n",
 			status,
-			truncate(s.Title, 40),
+			truncate(s.Title, 55),
 			truncate(s.Author, 30),
+			days,
 			libs,
 		)
 	}
@@ -451,9 +510,9 @@ func main() {
 	author := flag.String("author", "Alexandra Bracken", "Author (optional)")
 	libs := flag.String("libs", "pittsburgh,chester,freelibrary", "Comma-separated library keys (thunder API keys)")
 	outJSON := flag.Bool("json", false, "Output results as JSON")
-	timeoutSec := flag.Int("timeout", 5, "Per-request timeout in seconds")
-	parallel := flag.Int("parallel", 4, "Number of concurrent requests")
-	ratePerSec := flag.Int("rate", 5, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
+	timeoutSec := flag.Int("timeout", 15, "Per-request timeout in seconds")
+	parallel := flag.Int("parallel", 8, "Number of concurrent requests")
+	ratePerSec := flag.Int("rate", 20, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
 	goodreadsFile := flag.String("goodreads", "", "Path to a Goodreads library export CSV; checks all to-read books")
 	verbose := flag.Bool("verbose", false, "Print progress information to stderr")
 	flag.Parse()
