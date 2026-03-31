@@ -19,6 +19,7 @@ scorpio
 /vendor
 /target
 /bin
+/reports
 
 # Environment config files
 /.env*
