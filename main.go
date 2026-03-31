@@ -127,11 +127,17 @@ func doGetWithCtx(ctx context.Context, client *http.Client, limiter <-chan struc
 		b, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
 			lastErr = fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+			if resp.StatusCode == http.StatusTooManyRequests {
+				backoff := time.Duration(attempt+1) * 5 * time.Second
+				log.Printf("warning: rate-limited (HTTP 429) by Thunder API — backing off %s (attempt %d/3), consider lowering --rate", backoff, attempt+1)
+				time.Sleep(backoff)
+			} else {
+				time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			default:
-				time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
 				continue
 			}
 		}
@@ -504,9 +510,9 @@ func main() {
 	author := flag.String("author", "Alexandra Bracken", "Author (optional)")
 	libs := flag.String("libs", "pittsburgh,chester,freelibrary", "Comma-separated library keys (thunder API keys)")
 	outJSON := flag.Bool("json", false, "Output results as JSON")
-	timeoutSec := flag.Int("timeout", 5, "Per-request timeout in seconds")
-	parallel := flag.Int("parallel", 4, "Number of concurrent requests")
-	ratePerSec := flag.Int("rate", 5, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
+	timeoutSec := flag.Int("timeout", 15, "Per-request timeout in seconds")
+	parallel := flag.Int("parallel", 8, "Number of concurrent requests")
+	ratePerSec := flag.Int("rate", 10, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
 	goodreadsFile := flag.String("goodreads", "", "Path to a Goodreads library export CSV; checks all to-read books")
 	verbose := flag.Bool("verbose", false, "Print progress information to stderr")
 	flag.Parse()

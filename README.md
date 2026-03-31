@@ -51,12 +51,17 @@ Alternatively, open [libbyapp.com](https://libbyapp.com) in your browser, sign i
 Export your library from Goodreads (**My Books → Import and Export → Export Library**), then:
 
 ```bash
-./bin/audio-scout \
-  --goodreads goodreads_library_export.csv \
-  --libs pittsburgh,chester,freelibrary
+time ./bin/audio-scout \
+  --goodreads testdata/goodreads_library_export.csv \
+  --libs pittsburgh,chester,freelibrary \
+  --rate 10 \
+  --parallel 8 \
+  --timeout 15 \
+  --verbose \
+  > available.txt
 ```
 
-Only books on your **to-read** shelf are checked. Books with no audiobook edition, or where the library doesn't own a copy, produce no output.
+Only books on your **to-read** shelf are checked. Books with no audiobook edition, or where the library doesn't own a copy, produce no output. Progress and any warnings stream to stderr so you can watch the run while stdout goes cleanly to the file. Prepending `time` gives you a wall-clock summary when it finishes.
 
 ## Flags
 
@@ -66,9 +71,9 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 | `--author` | `"Alexandra Bracken"` | Author name (single-book mode, optional) |
 | `--libs` | `pittsburgh,chester,freelibrary` | Comma-separated library keys |
 | `--goodreads` | _(none)_ | Path to a Goodreads CSV export; checks all to-read books |
-| `--rate` | `5` | Max HTTP requests per second toward the Thunder API |
-| `--parallel` | `4` | Number of concurrent worker goroutines |
-| `--timeout` | `5` | Per-request HTTP timeout in seconds |
+| `--rate` | `10` | Max HTTP requests per second toward the Thunder API |
+| `--parallel` | `8` | Number of concurrent worker goroutines |
+| `--timeout` | `15` | Per-request HTTP timeout in seconds |
 | `--json` | `false` | Emit results as JSON instead of plain text |
 | `--verbose` | `false` | Print progress and hits to stderr while running |
 
@@ -131,9 +136,15 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 
 ## Rate limiting
 
-The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **30–50 minutes** at this rate.
+The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **6–8 minutes** at this rate.
 
-If you see HTTP 429 responses, lower the rate:
+If the Thunder API rate-limits you, a warning is printed to **stderr**:
+
+```
+warning: rate-limited (HTTP 429) by Thunder API — consider lowering --rate (attempt 1)
+```
+
+The request will be retried automatically with backoff, but if you see many of these, lower the rate:
 
 ```bash
 ./bin/audio-scout --goodreads export.csv --rate 3
