@@ -512,7 +512,7 @@ func main() {
 	outJSON := flag.Bool("json", false, "Output results as JSON")
 	timeoutSec := flag.Int("timeout", 15, "Per-request timeout in seconds")
 	parallel := flag.Int("parallel", 8, "Number of concurrent requests")
-	ratePerSec := flag.Int("rate", 10, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
+	ratePerSec := flag.Int("rate", 20, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
 	goodreadsFile := flag.String("goodreads", "", "Path to a Goodreads library export CSV; checks all to-read books")
 	verbose := flag.Bool("verbose", false, "Print progress information to stderr")
 	flag.Parse()

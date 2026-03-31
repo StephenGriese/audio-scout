@@ -54,7 +54,7 @@ Export your library from Goodreads (**My Books → Import and Export → Export 
 time ./bin/audio-scout \
   --goodreads testdata/goodreads_library_export.csv \
   --libs pittsburgh,chester,freelibrary \
-  --rate 10 \
+  --rate 20 \
   --parallel 8 \
   --timeout 15 \
   --verbose \
@@ -71,7 +71,7 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 | `--author` | `"Alexandra Bracken"` | Author name (single-book mode, optional) |
 | `--libs` | `pittsburgh,chester,freelibrary` | Comma-separated library keys |
 | `--goodreads` | _(none)_ | Path to a Goodreads CSV export; checks all to-read books |
-| `--rate` | `10` | Max HTTP requests per second toward the Thunder API |
+| `--rate` | `20` | Max HTTP requests per second toward the Thunder API |
 | `--parallel` | `8` | Number of concurrent worker goroutines |
 | `--timeout` | `15` | Per-request HTTP timeout in seconds |
 | `--json` | `false` | Emit results as JSON instead of plain text |
@@ -136,7 +136,7 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 
 ## Rate limiting
 
-The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **6–8 minutes** at this rate.
+The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **3–4 minutes** at this rate.
 
 If the Thunder API rate-limits you, a warning is printed to **stderr**:
 
