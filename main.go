@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	_ "github.com/PuerkitoBio/goquery"
 	"io"
 	"log"
 	"net/http"
@@ -27,9 +26,9 @@ type Library struct {
 
 // BookQuery is the title + optional author used to search for a specific audiobook.
 type BookQuery struct {
-	Title       string
-	Author      string
-	DaysOnList  int // 0 when unknown (e.g. single-book mode)
+	Title      string
+	Author     string
+	DaysOnList int // 0 when unknown (e.g. single-book mode)
 }
 
 func (b BookQuery) searchQuery() string {
@@ -119,13 +118,19 @@ func doGetWithCtx(ctx context.Context, client *http.Client, limiter <-chan struc
 				continue
 			}
 		}
-		defer func() {
-			if err := resp.Body.Close(); err != nil {
-				log.Printf("warning: failed to close response body: %v", err)
+
+		// Close the body explicitly — do NOT use defer here because we are
+		// inside a retry loop and defer would hold every response body open
+		// until the function returns (potential connection/memory leak).
+		closeBody := func() {
+			if cerr := resp.Body.Close(); cerr != nil {
+				log.Printf("warning: failed to close response body: %v", cerr)
 			}
-		}()
+		}
+
 		b, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
+			closeBody()
 			lastErr = fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 			if resp.StatusCode == http.StatusTooManyRequests {
 				backoff := time.Duration(attempt+1) * 5 * time.Second
@@ -141,6 +146,7 @@ func doGetWithCtx(ctx context.Context, client *http.Client, limiter <-chan struc
 				continue
 			}
 		}
+		closeBody()
 		return b, nil
 	}
 	if lastErr == nil {
@@ -228,9 +234,9 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 
 // goodreadsRow holds the fields we care about from the Goodreads CSV export.
 type goodreadsRow struct {
-	Title       string
-	Author      string // "First Last" format (column "Author")
-	DaysOnList  int    // days since "Date Added" in the Goodreads export; 0 if unknown
+	Title      string
+	Author     string // "First Last" format (column "Author")
+	DaysOnList int    // days since "Date Added" in the Goodreads export; 0 if unknown
 }
 
 // parseGoodreadsToRead reads a Goodreads library export CSV and returns all
@@ -335,7 +341,7 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 		var days int
 		if row.dateAdded != "" {
 			if t, err := time.Parse("2006/01/02", row.dateAdded); err == nil {
-				days = int(today.Sub(t.Truncate(24 * time.Hour)).Hours() / 24)
+				days = int(today.Sub(t.Truncate(24*time.Hour)).Hours() / 24)
 			}
 		}
 		books = append(books, goodreadsRow{Title: row.title, Author: row.author, DaysOnList: days})
@@ -402,7 +408,7 @@ func runGoodreadsMode(
 					if br.Available {
 						status = "AVAILABLE"
 					}
-					fmt.Fprintf(os.Stderr, "  [hit] %s @ %s — %s\n", truncate(b.Title, 50), l.Name, status)
+					_, _ = fmt.Fprintf(os.Stderr, "  [hit] %s @ %s — %s\n", truncate(b.Title, 50), l.Name, status)
 				}
 			}(bq, lib)
 		}
@@ -412,7 +418,7 @@ func runGoodreadsMode(
 		// We use a separate goroutine-safe counter on completion instead.
 		n := completed.Add(1)
 		if verbose && n%10 == 0 {
-			fmt.Fprintf(os.Stderr, "  [progress] %d / %d books dispatched...\n", n, total)
+			_, _ = fmt.Fprintf(os.Stderr, "  [progress] %d / %d books dispatched...\n", n, total)
 		}
 	}
 
@@ -422,11 +428,11 @@ func runGoodreadsMode(
 	// Collect hits and collapse per-library results into one row per book.
 	// A book is AVAILABLE if any library has it now; otherwise WAITLIST.
 	type bookSummary struct {
-		Title       string
-		Author      string
-		Available   bool
-		DaysOnList  int
-		Libraries   []string
+		Title      string
+		Author     string
+		Available  bool
+		DaysOnList int
+		Libraries  []string
 	}
 	type bookKey struct{ Title, Author string }
 	summaries := make(map[bookKey]*bookSummary)
@@ -448,7 +454,7 @@ func runGoodreadsMode(
 	}
 
 	if len(summaries) == 0 {
-		fmt.Fprintln(os.Stderr, "No to-read audiobooks are currently available or reservable at the specified libraries.")
+		_, _ = fmt.Fprintln(os.Stderr, "No to-read audiobooks are currently available or reservable at the specified libraries.")
 		return
 	}
 
@@ -543,7 +549,7 @@ func main() {
 			log.Fatalf("Error reading Goodreads export: %v", err)
 		}
 		if *verbose {
-			fmt.Fprintf(os.Stderr, "Found %d to-read books in %s\n", len(books), *goodreadsFile)
+			_, _ = fmt.Fprintf(os.Stderr, "Found %d to-read books in %s\n", len(books), *goodreadsFile)
 		}
 		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *verbose)
 		return

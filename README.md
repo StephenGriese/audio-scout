@@ -161,6 +161,14 @@ make clean    # remove bin/
 
 > `make init` only needs to be run once after cloning. It points git at the project's `.githooks/` directory so pre-commit checks run automatically. `make checks` and `make build` will refuse to run until it has been called.
 
+## Why Hoopla is not supported
+
+Hoopla would be a natural fit — their model is "always available, no waitlist", so if a title exists on Hoopla you can borrow it immediately. However, Hoopla has no public API.
+
+Investigation found that their website is a fully client-side Next.js app (no server-rendered data), and their actual search backend is `search-api.hoopladigital.com/prod/` — an AWS API Gateway endpoint that requires **AWS Signature V4** authentication. There is no publicly accessible path to query it without credentials that Hoopla controls.
+
+The [Library Extension](https://www.libraryextension.com/) browser plugin supports Hoopla but is closed-source, so its approach could not be examined. If Hoopla ever publishes a public API, or if an open-source integration approach is discovered, this would be worth revisiting.
+
 ## License
 
 MIT - Normal for hobby projects
