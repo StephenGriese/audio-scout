@@ -15,8 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	_ "github.com/PuerkitoBio/goquery"
 )
 
 // Library holds the display name and the Thunder API key for the library.
