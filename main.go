@@ -265,41 +265,74 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 	if !ok {
 		return nil, fmt.Errorf("CSV missing 'Exclusive Shelf' column")
 	}
-	dateAddedIdx := colIdx["Date Added"] // optional; -1 if absent (map returns 0 for missing, but ok handles that)
+	dateAddedIdx := colIdx["Date Added"] // optional
 	_, hasDateAdded := colIdx["Date Added"]
 
 	today := time.Now().Truncate(24 * time.Hour)
 
-	var books []goodreadsRow
+	// First pass: collect every title+author the user has already read.
+	// We'll skip these even if they also appear on to-read (e.g. a book
+	// exported twice with different shelf values).
+	alreadyRead := make(map[string]struct{})
+	type rawRow struct {
+		title     string
+		author    string
+		shelf     string
+		dateAdded string
+	}
+	var allRows []rawRow
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			// Skip malformed rows.
-			continue
+			continue // skip malformed rows
 		}
 		if len(rec) <= shelfIdx {
 			continue
 		}
-		if strings.TrimSpace(rec[shelfIdx]) != "to-read" {
-			continue
-		}
 		title := strings.TrimSpace(rec[titleIdx])
 		author := strings.TrimSpace(rec[authorIdx])
+		shelf := strings.TrimSpace(rec[shelfIdx])
+		var dateAdded string
+		if hasDateAdded && dateAddedIdx < len(rec) {
+			dateAdded = strings.TrimSpace(rec[dateAddedIdx])
+		}
 		if title == "" {
 			continue
 		}
+		allRows = append(allRows, rawRow{title, author, shelf, dateAdded})
+		if shelf == "read" {
+			key := strings.ToLower(title) + "\x00" + strings.ToLower(author)
+			alreadyRead[key] = struct{}{}
+		}
+	}
+
+	// Second pass: collect to-read books, skipping anything already read
+	// and deduplicating within the to-read set itself.
+	seen := make(map[string]struct{})
+	var books []goodreadsRow
+	for _, row := range allRows {
+		if row.shelf != "to-read" {
+			continue
+		}
+		key := strings.ToLower(row.title) + "\x00" + strings.ToLower(row.author)
+		if _, done := alreadyRead[key]; done {
+			log.Printf("skipping %q — already marked as read", row.title)
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
 		var days int
-		if hasDateAdded && dateAddedIdx < len(rec) {
-			if raw := strings.TrimSpace(rec[dateAddedIdx]); raw != "" {
-				if t, err := time.Parse("2006/01/02", raw); err == nil {
-					days = int(today.Sub(t.Truncate(24 * time.Hour)).Hours() / 24)
-				}
+		if row.dateAdded != "" {
+			if t, err := time.Parse("2006/01/02", row.dateAdded); err == nil {
+				days = int(today.Sub(t.Truncate(24 * time.Hour)).Hours() / 24)
 			}
 		}
-		books = append(books, goodreadsRow{Title: title, Author: author, DaysOnList: days})
+		books = append(books, goodreadsRow{Title: row.title, Author: row.author, DaysOnList: days})
 	}
 	return books, nil
 }
