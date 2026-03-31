@@ -602,9 +602,23 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — fetching Goodreads series page...\n", sd.dispName)
 		}
 
-		seriesBooks, err := goodreadsSeriesPage(readBookID)
+		var seriesBooks [][2]string
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			seriesBooks, err = goodreadsSeriesPage(readBookID)
+			if err == nil {
+				break
+			}
+			if attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * 5 * time.Second
+				if verbose {
+					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — attempt %d failed, retrying in %v...\n", sd.dispName, attempt, backoff)
+				}
+				time.Sleep(backoff)
+			}
+		}
 		if err != nil {
-			log.Printf("warning: series lookup for %q failed: %v", sd.dispName, err)
+			log.Printf("warning: series lookup for %q failed after 3 attempts: %v", sd.dispName, err)
 			continue
 		}
 
