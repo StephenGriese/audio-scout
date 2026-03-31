@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,7 +30,8 @@ type Library struct {
 type BookQuery struct {
 	Title      string
 	Author     string
-	DaysOnList int // 0 when unknown (e.g. single-book mode)
+	DaysOnList int    // 0 when unknown (e.g. single-book mode)
+	SeriesNote string // optional annotation shown in output (e.g. "not in your Goodreads")
 }
 
 func (b BookQuery) searchQuery() string {
@@ -237,6 +240,7 @@ type goodreadsRow struct {
 	Title      string
 	Author     string // "First Last" format (column "Author")
 	DaysOnList int    // days since "Date Added" in the Goodreads export; 0 if unknown
+	SeriesNote string // optional annotation, e.g. "not in Goodreads list"
 }
 
 // parseGoodreadsToRead reads a Goodreads library export CSV and returns all
@@ -349,6 +353,289 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 	return books, nil
 }
 
+// seriesRE matches the Goodreads series suffix in a title, e.g.:
+//
+//	"The Name of the Wind (Kingkiller Chronicle, #1)"  →  series="Kingkiller Chronicle", num="1"
+//	"A Memory of Light (The Wheel of Time, #14)"       →  series="The Wheel of Time",    num="14"
+var seriesRE = regexp.MustCompile(`\(([^)]+),\s*#([0-9]+(?:\.[0-9]+)?)\)\s*$`)
+
+// seriesSlugRE extracts the Goodreads series slug from a book page, e.g. "/series/45015-will-trent"
+var seriesSlugRE = regexp.MustCompile(`/series/([0-9]+-[a-z0-9-]+)`)
+
+// seriesBookRE extracts (series tag, position, bare title) from the entity-encoded JSON
+// embedded in a Goodreads series page, e.g.:
+//
+//	&quot;title&quot;:&quot;Triptych (Will Trent, #1)&quot; ... &quot;bookTitleBare&quot;:&quot;Triptych&quot;
+var seriesBookRE = regexp.MustCompile(
+	`&quot;title&quot;:&quot;[^&]+\(([^,&]+),\s*#([0-9]+(?:\.[0-9]+)?)\)&quot;` +
+		`.*?&quot;bookTitleBare&quot;:&quot;([^&]+)&quot;`)
+
+// seriesEntry is one book in a series as recorded in the Goodreads export.
+type seriesEntry struct {
+	GoodreadsID string  // from the "Book Id" CSV column
+	Num         float64 // series position (1, 2, 3 …)
+	Title       string  // clean title without the series suffix
+	Author      string
+	Shelf       string // "read", "to-read", "currently-reading", …
+}
+
+// goodreadsSeriesPage fetches the Goodreads book page for goodreadsID,
+// extracts the series page slug, fetches that series page, and returns
+// all (position, bare title) pairs found there.
+// Returns nil, nil if the series page cannot be determined or parsed.
+func goodreadsSeriesPage(goodreadsID string) ([][2]string, error) {
+	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+	// Step 1: fetch the book page to find the series slug.
+	bookURL := "https://www.goodreads.com/book/show/" + goodreadsID
+	req, _ := http.NewRequest("GET", bookURL, nil)
+	req.Header.Set("User-Agent", ua)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch book page: %w", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if cerr := resp.Body.Close(); cerr != nil {
+		log.Printf("warning: failed to close book page response body: %v", cerr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read book page: %w", err)
+	}
+
+	m := seriesSlugRE.FindSubmatch(body)
+	if m == nil {
+		return nil, nil // book not part of a series on Goodreads
+	}
+	slug := string(m[1])
+
+	// Step 2: fetch the series page.
+	seriesURL := "https://www.goodreads.com/series/" + slug
+	req2, _ := http.NewRequest("GET", seriesURL, nil)
+	req2.Header.Set("User-Agent", ua)
+	resp2, err := client.Do(req2)
+	if err != nil {
+		return nil, fmt.Errorf("fetch series page: %w", err)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	if cerr := resp2.Body.Close(); cerr != nil {
+		log.Printf("warning: failed to close series page response body: %v", cerr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read series page: %w", err)
+	}
+
+	// Step 3: extract all (position, bare title) pairs from embedded JSON.
+	matches := seriesBookRE.FindAllSubmatch(body2, -1)
+	seen := make(map[float64]bool)
+	var results [][2]string // [position_str, bare_title]
+	for _, m2 := range matches {
+		posStr := string(m2[2])
+		pos, _ := strconv.ParseFloat(posStr, 64)
+		if seen[pos] {
+			continue
+		}
+		seen[pos] = true
+		// HTML-unescape the bare title (handles &amp; etc.)
+		bare := strings.NewReplacer(
+			"&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", `"`, "&#39;", "'",
+		).Replace(string(m2[3]))
+		results = append(results, [2]string{posStr, bare})
+	}
+	return results, nil
+}
+
+// parseSeriesNextBooks reads the full Goodreads export and returns, for every
+// series the user has started reading, the next book they haven't read yet.
+// It first checks the CSV for the next book; if not found there, it looks up
+// the Goodreads series page to find it. Each returned row has a SeriesNote
+// indicating whether the book was found in the CSV or discovered via Goodreads.
+func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNovellas bool) ([]goodreadsRow, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("warning: failed to close goodreads file: %v", cerr)
+		}
+	}()
+
+	r := csv.NewReader(f)
+	r.LazyQuotes = true
+
+	header, err := r.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
+	}
+	colIdx := make(map[string]int, len(header))
+	for i, h := range header {
+		colIdx[strings.TrimSpace(h)] = i
+	}
+	titleIdx, ok := colIdx["Title"]
+	if !ok {
+		return nil, fmt.Errorf("CSV missing 'Title' column")
+	}
+	authorIdx, ok := colIdx["Author"]
+	if !ok {
+		return nil, fmt.Errorf("CSV missing 'Author' column")
+	}
+	shelfIdx, ok := colIdx["Exclusive Shelf"]
+	if !ok {
+		return nil, fmt.Errorf("CSV missing 'Exclusive Shelf' column")
+	}
+	bookIDIdx, hasBookID := colIdx["Book Id"]
+
+	// Collect every series entry from the CSV (all shelves).
+	type seriesData struct {
+		entries  []seriesEntry
+		dispName string // canonical series name for display
+	}
+	seriesMap := make(map[string]*seriesData) // key = lowercase series name
+
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue
+		}
+		if len(rec) <= shelfIdx {
+			continue
+		}
+		rawTitle := strings.TrimSpace(rec[titleIdx])
+		m := seriesRE.FindStringSubmatch(rawTitle)
+		if m == nil {
+			continue
+		}
+		series := strings.TrimSpace(m[1])
+		num, _ := strconv.ParseFloat(m[2], 64)
+		cleanTitle := strings.TrimSpace(rawTitle[:strings.LastIndex(rawTitle, "(")])
+		author := strings.TrimSpace(rec[authorIdx])
+		shelf := strings.TrimSpace(rec[shelfIdx])
+		var bookID string
+		if hasBookID && bookIDIdx < len(rec) {
+			bookID = strings.TrimSpace(rec[bookIDIdx])
+		}
+
+		key := strings.ToLower(series)
+		if _, exists := seriesMap[key]; !exists {
+			seriesMap[key] = &seriesData{dispName: series}
+		}
+		seriesMap[key].entries = append(seriesMap[key].entries, seriesEntry{
+			GoodreadsID: bookID,
+			Num:         num,
+			Title:       cleanTitle,
+			Author:      author,
+			Shelf:       shelf,
+		})
+	}
+
+	var next []goodreadsRow
+	for _, sd := range seriesMap {
+		entries := sd.entries
+
+		// Find highest book number the user has read or is currently reading,
+		// plus a Goodreads ID we can use for series-page lookups.
+		var maxRead float64
+		var readBookID, readAuthor string
+		var currentlyReadingNum float64 // >0 if any book is on currently-reading shelf
+		hasStarted := false
+		for _, e := range entries {
+			if e.Shelf == "read" || e.Shelf == "currently-reading" {
+				hasStarted = true
+				if e.Num > maxRead {
+					maxRead = e.Num
+					readBookID = e.GoodreadsID
+					readAuthor = e.Author
+				}
+				if e.Shelf == "currently-reading" && e.Num > currentlyReadingNum {
+					currentlyReadingNum = e.Num
+				}
+			}
+		}
+		if !hasStarted {
+			continue
+		}
+
+		// Check if the next book is already in the CSV.
+		var csvCandidate *seriesEntry
+		for i := range entries {
+			e := &entries[i]
+			if e.Shelf == "read" || e.Num <= maxRead {
+				continue
+			}
+			if csvCandidate == nil || e.Num < csvCandidate.Num {
+				csvCandidate = e
+			}
+		}
+
+		if csvCandidate != nil {
+			// Next book is already in Goodreads — use it directly.
+			seriesNote := "in your Goodreads"
+			if currentlyReadingNum > 0 && csvCandidate.Num == currentlyReadingNum+1 {
+				seriesNote = fmt.Sprintf("up next — currently reading #%.4g", currentlyReadingNum)
+			}
+			log.Printf("series: %q — read up to #%.4g, next is #%.4g %q (in Goodreads)",
+				sd.dispName, maxRead, csvCandidate.Num, csvCandidate.Title)
+			next = append(next, goodreadsRow{
+				Title:      csvCandidate.Title,
+				Author:     csvCandidate.Author,
+				SeriesNote: seriesNote,
+			})
+			continue
+		}
+
+		// Next book is NOT in the CSV — look it up on the Goodreads series page.
+		if readBookID == "" {
+			continue // no Goodreads ID available to look up
+		}
+
+		select {
+		case <-ctx.Done():
+			return next, ctx.Err()
+		default:
+		}
+
+		if verbose {
+			_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — fetching Goodreads series page...\n", sd.dispName)
+		}
+
+		seriesBooks, err := goodreadsSeriesPage(readBookID)
+		if err != nil {
+			log.Printf("warning: series lookup for %q failed: %v", sd.dispName, err)
+			continue
+		}
+
+		// Find the next whole-number book above maxRead.
+		// Optionally skip .5 books (novellas/short stories).
+		for _, pair := range seriesBooks {
+			pos, _ := strconv.ParseFloat(pair[0], 64)
+			if pos <= maxRead {
+				continue
+			}
+			// Skip novellas (e.g. #1.5, #2.5) only when --skip-novellas is set.
+			if skipNovellas && pos != float64(int(pos)) {
+				continue
+			}
+			seriesNote := "not in your Goodreads"
+			if currentlyReadingNum > 0 && pos == currentlyReadingNum+1 {
+				seriesNote = fmt.Sprintf("up next — currently reading #%.4g", currentlyReadingNum)
+			}
+			log.Printf("series: %q — read up to #%.4g, next is #%.4g %q (not in Goodreads)",
+				sd.dispName, maxRead, pos, pair[1])
+			next = append(next, goodreadsRow{
+				Title:      pair[1],
+				Author:     readAuthor,
+				SeriesNote: seriesNote,
+			})
+			break
+		}
+	}
+	return next, nil
+}
+
 // bookResult pairs a BookQuery with a per-library result.
 type bookResult struct {
 	Book    BookQuery
@@ -432,6 +719,7 @@ func runGoodreadsMode(
 		Author     string
 		Available  bool
 		DaysOnList int
+		SeriesNote string
 		Libraries  []string
 	}
 	type bookKey struct{ Title, Author string }
@@ -443,7 +731,12 @@ func runGoodreadsMode(
 		k := bookKey{br.Book.Title, br.Book.Author}
 		s, exists := summaries[k]
 		if !exists {
-			s = &bookSummary{Title: br.Book.Title, Author: br.Book.Author, DaysOnList: br.Book.DaysOnList}
+			s = &bookSummary{
+				Title:      br.Book.Title,
+				Author:     br.Book.Author,
+				DaysOnList: br.Book.DaysOnList,
+				SeriesNote: br.Book.SeriesNote,
+			}
 			summaries[k] = s
 			order = append(order, k)
 		}
@@ -491,12 +784,17 @@ func runGoodreadsMode(
 		if s.DaysOnList > 0 {
 			days = fmt.Sprintf("%dd", s.DaysOnList)
 		}
-		fmt.Printf("%-9s  %-55s  %-30s  %5s  %s\n",
+		note := ""
+		if s.SeriesNote != "" {
+			note = "  [" + s.SeriesNote + "]"
+		}
+		fmt.Printf("%-9s  %-55s  %-30s  %5s  %s%s\n",
 			status,
 			truncate(s.Title, 55),
 			truncate(s.Author, 30),
 			days,
 			libs,
+			note,
 		)
 	}
 }
@@ -520,6 +818,8 @@ func main() {
 	parallel := flag.Int("parallel", 8, "Number of concurrent requests")
 	ratePerSec := flag.Int("rate", 20, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
 	goodreadsFile := flag.String("goodreads", "", "Path to a Goodreads library export CSV; checks all to-read books")
+	seriesMode := flag.Bool("series", false, "Check next-in-series books for series you have started (requires --goodreads)")
+	skipNovellas := flag.Bool("skip-novellas", false, "In series mode, skip novellas and short stories (non-integer positions like #1.5)")
 	verbose := flag.Bool("verbose", false, "Print progress information to stderr")
 	flag.Parse()
 
@@ -544,6 +844,22 @@ func main() {
 
 	// --goodreads mode: scan every to-read book across all libraries.
 	if *goodreadsFile != "" {
+		if *seriesMode {
+			// --series mode: find next-in-series books for series you have started.
+			books, err := parseSeriesNextBooks(ctx, *goodreadsFile, *verbose, *skipNovellas)
+			if err != nil {
+				log.Fatalf("Error reading Goodreads export: %v", err)
+			}
+			if len(books) == 0 {
+				_, _ = fmt.Fprintln(os.Stderr, "No incomplete series found.")
+				return
+			}
+			if *verbose {
+				_, _ = fmt.Fprintf(os.Stderr, "Found %d next-in-series books to check\n", len(books))
+			}
+			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *verbose)
+			return
+		}
 		books, err := parseGoodreadsToRead(*goodreadsFile)
 		if err != nil {
 			log.Fatalf("Error reading Goodreads export: %v", err)

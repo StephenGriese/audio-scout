@@ -63,6 +63,29 @@ time ./bin/audio-scout \
 
 Only books on your **to-read** shelf are checked. Books with no audiobook edition, or where the library doesn't own a copy, produce no output. Progress and any warnings stream to stderr so you can watch the run while stdout goes cleanly to the file. Prepending `time` gives you a wall-clock summary when it finishes.
 
+### Find next books in series you have started
+
+Goodreads embeds series info in the title field, e.g. `"The Name of the Wind (Kingkiller Chronicle, #1)"`. The `--series` flag uses this to find every series where you have at least one book marked as **read**, then checks Libby availability for the next unread book in each:
+
+```bash
+./bin/audio-scout \
+  --goodreads testdata/goodreads_library_export.csv \
+  --libs pittsburgh,chester,freelibrary \
+  --series \
+  --verbose
+```
+
+Sample output:
+```
+AVAILABLE  The Broken Eye                                 Brent Weeks                          pittsburgh,chester
+WAITLIST   Of Darkness and Light                         Ryan Cahill                          pittsburgh,chester,freelibrary
+```
+
+Only series where the **next book's title is known** in your Goodreads export are checked. Progress is logged to stderr:
+```
+series: "Kingkiller Chronicle" — read up to #2, next is #3 "The Doors of Stone"
+```
+
 ## Flags
 
 | Flag | Default | Description |
@@ -71,6 +94,7 @@ Only books on your **to-read** shelf are checked. Books with no audiobook editio
 | `--author` | `"Alexandra Bracken"` | Author name (single-book mode, optional) |
 | `--libs` | `pittsburgh,chester,freelibrary` | Comma-separated library keys |
 | `--goodreads` | _(none)_ | Path to a Goodreads CSV export; checks all to-read books |
+| `--series` | `false` | Check next-in-series audiobook availability for series you have started (requires `--goodreads`) |
 | `--rate` | `20` | Max HTTP requests per second toward the Thunder API |
 | `--parallel` | `8` | Number of concurrent worker goroutines |
 | `--timeout` | `15` | Per-request HTTP timeout in seconds |
@@ -172,4 +196,3 @@ The [Library Extension](https://www.libraryextension.com/) browser plugin suppor
 ## License
 
 MIT - Normal for hobby projects
-
