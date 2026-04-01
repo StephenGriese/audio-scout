@@ -5,6 +5,7 @@
 *.so
 *.dylib
 scorpio
+/audio-scout
 
 # local logging (used in prod)
 *.log
