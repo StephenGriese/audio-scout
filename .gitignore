@@ -22,9 +22,8 @@ scorpio
 /bin
 /reports
 
-# Run output (logs, results) — directory is tracked via .gitkeep
-/output/*
-!/output/.gitkeep
+# Run output files in root
+run-*
 
 # Environment config files
 /.env*
