@@ -32,6 +32,7 @@ type BookQuery struct {
 	Author     string
 	DaysOnList int    // 0 when unknown (e.g. single-book mode)
 	SeriesNote string // optional annotation shown in output (e.g. "not in your Goodreads")
+	SeriesName string // series name, shown in series mode output
 }
 
 func (b BookQuery) searchQuery() string {
@@ -241,6 +242,7 @@ type goodreadsRow struct {
 	Author     string // "First Last" format (column "Author")
 	DaysOnList int    // days since "Date Added" in the Goodreads export; 0 if unknown
 	SeriesNote string // optional annotation, e.g. "not in Goodreads list"
+	SeriesName string // series name, populated in series mode
 }
 
 // parseGoodreadsToRead reads a Goodreads library export CSV and returns all
@@ -309,7 +311,7 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 			continue
 		}
 		title := strings.TrimSpace(rec[titleIdx])
-		author := strings.TrimSpace(rec[authorIdx])
+		author := strings.Join(strings.Fields(rec[authorIdx]), " ")
 		shelf := strings.TrimSpace(rec[shelfIdx])
 		var dateAdded string
 		if hasDateAdded && dateAddedIdx < len(rec) {
@@ -512,7 +514,7 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		series := strings.TrimSpace(m[1])
 		num, _ := strconv.ParseFloat(m[2], 64)
 		cleanTitle := strings.TrimSpace(rawTitle[:strings.LastIndex(rawTitle, "(")])
-		author := strings.TrimSpace(rec[authorIdx])
+		author := strings.Join(strings.Fields(rec[authorIdx]), " ")
 		shelf := strings.TrimSpace(rec[shelfIdx])
 		var bookID string
 		if hasBookID && bookIDIdx < len(rec) {
@@ -583,6 +585,7 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 				Title:      csvCandidate.Title,
 				Author:     csvCandidate.Author,
 				SeriesNote: seriesNote,
+				SeriesName: sd.dispName,
 			})
 			continue
 		}
@@ -602,9 +605,23 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — fetching Goodreads series page...\n", sd.dispName)
 		}
 
-		seriesBooks, err := goodreadsSeriesPage(readBookID)
+		var seriesBooks [][2]string
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			seriesBooks, err = goodreadsSeriesPage(readBookID)
+			if err == nil {
+				break
+			}
+			if attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * 5 * time.Second
+				if verbose {
+					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — attempt %d failed, retrying in %v...\n", sd.dispName, attempt, backoff)
+				}
+				time.Sleep(backoff)
+			}
+		}
 		if err != nil {
-			log.Printf("warning: series lookup for %q failed: %v", sd.dispName, err)
+			log.Printf("warning: series lookup for %q failed after 3 attempts: %v", sd.dispName, err)
 			continue
 		}
 
@@ -629,6 +646,7 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 				Title:      pair[1],
 				Author:     readAuthor,
 				SeriesNote: seriesNote,
+				SeriesName: sd.dispName,
 			})
 			break
 		}
@@ -720,6 +738,7 @@ func runGoodreadsMode(
 		Available  bool
 		DaysOnList int
 		SeriesNote string
+		SeriesName string
 		Libraries  []string
 	}
 	type bookKey struct{ Title, Author string }
@@ -736,6 +755,7 @@ func runGoodreadsMode(
 				Author:     br.Book.Author,
 				DaysOnList: br.Book.DaysOnList,
 				SeriesNote: br.Book.SeriesNote,
+				SeriesName: br.Book.SeriesName,
 			}
 			summaries[k] = s
 			order = append(order, k)
@@ -785,7 +805,12 @@ func runGoodreadsMode(
 			days = fmt.Sprintf("%dd", s.DaysOnList)
 		}
 		note := ""
-		if s.SeriesNote != "" {
+		if s.SeriesName != "" {
+			note = "  [" + s.SeriesName + "]"
+			if s.SeriesNote != "" {
+				note += "  [" + s.SeriesNote + "]"
+			}
+		} else if s.SeriesNote != "" {
 			note = "  [" + s.SeriesNote + "]"
 		}
 		fmt.Printf("%-9s  %-55s  %-30s  %5s  %s%s\n",

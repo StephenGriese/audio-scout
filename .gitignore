@@ -5,6 +5,7 @@
 *.so
 *.dylib
 scorpio
+/audio-scout
 
 # local logging (used in prod)
 *.log
@@ -20,6 +21,10 @@ scorpio
 /target
 /bin
 /reports
+
+# Run output (logs, results) — directory is tracked via .gitkeep
+/output/*
+!/output/.gitkeep
 
 # Environment config files
 /.env*
