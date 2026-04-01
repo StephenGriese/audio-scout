@@ -886,26 +886,17 @@ func runGoodreadsMode(
 			status = "AVAILABLE"
 		}
 		libs := strings.Join(s.Libraries, ",")
-		days := ""
-		if s.DaysOnList > 0 {
-			days = fmt.Sprintf("%dd", s.DaysOnList)
+		toRead := ""
+		if s.SeriesNote == "in your Goodreads" {
+			toRead = "to-read"
 		}
-		note := ""
-		if s.SeriesName != "" {
-			note = "  [" + s.SeriesName + "]"
-			if s.SeriesNote != "" {
-				note += "  [" + s.SeriesNote + "]"
-			}
-		} else if s.SeriesNote != "" {
-			note = "  [" + s.SeriesNote + "]"
-		}
-		fmt.Printf("%-9s  %-55s  %-30s  %5s  %s%s\n",
+		fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %s\n",
 			status,
 			truncate(s.Title, 55),
+			truncate(s.SeriesName, 35),
+			toRead,
 			truncate(s.Author, 30),
-			days,
 			libs,
-			note,
 		)
 	}
 }
