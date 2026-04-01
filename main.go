@@ -495,6 +495,11 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 	}
 	seriesMap := make(map[string]*seriesData) // key = lowercase series name
 
+	// Also track all read titles globally (normalized) so we can skip books
+	// the user has already read under a different series name (e.g. a novella
+	// that appears in both "World of the Five Gods" and "Penric and Desdemona").
+	readTitles := make(map[string]struct{})
+
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
@@ -507,6 +512,13 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			continue
 		}
 		rawTitle := strings.TrimSpace(rec[titleIdx])
+		shelf := strings.TrimSpace(rec[shelfIdx])
+
+		// Track every read title globally, even books not in a series.
+		if shelf == "read" {
+			readTitles[strings.ToLower(strings.TrimSpace(rawTitle))] = struct{}{}
+		}
+
 		m := seriesRE.FindStringSubmatch(rawTitle)
 		if m == nil {
 			continue
@@ -515,10 +527,14 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		num, _ := strconv.ParseFloat(m[2], 64)
 		cleanTitle := strings.TrimSpace(rawTitle[:strings.LastIndex(rawTitle, "(")])
 		author := strings.Join(strings.Fields(rec[authorIdx]), " ")
-		shelf := strings.TrimSpace(rec[shelfIdx])
 		var bookID string
 		if hasBookID && bookIDIdx < len(rec) {
 			bookID = strings.TrimSpace(rec[bookIDIdx])
+		}
+
+		// Also index the clean title for cross-series read checking.
+		if shelf == "read" {
+			readTitles[strings.ToLower(cleanTitle)] = struct{}{}
 		}
 
 		key := strings.ToLower(series)
@@ -574,6 +590,13 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		}
 
 		if csvCandidate != nil {
+			// Skip if already read under a different series name.
+			if _, alreadyRead := readTitles[strings.ToLower(csvCandidate.Title)]; alreadyRead {
+				if verbose {
+					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — skipping %q (already read under another series)\n", sd.dispName, csvCandidate.Title)
+				}
+				continue
+			}
 			// Next book is already in Goodreads — use it directly.
 			seriesNote := "in your Goodreads"
 			if currentlyReadingNum > 0 && csvCandidate.Num == currentlyReadingNum+1 {
@@ -636,6 +659,13 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			if skipNovellas && pos != float64(int(pos)) {
 				continue
 			}
+			// Skip if already read under a different series name.
+			if _, alreadyRead := readTitles[strings.ToLower(pair[1])]; alreadyRead {
+				if verbose {
+					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — skipping %q (already read under another series)\n", sd.dispName, pair[1])
+				}
+				continue
+			}
 			seriesNote := "not in your Goodreads"
 			if currentlyReadingNum > 0 && pos == currentlyReadingNum+1 {
 				seriesNote = fmt.Sprintf("up next — currently reading #%.4g", currentlyReadingNum)
@@ -674,6 +704,20 @@ func runGoodreadsMode(
 	outJSON bool,
 	verbose bool,
 ) {
+	// Deduplicate books by title — the same book can appear under two series
+	// names (e.g. "George Smiley" and "George Smiley, #6; Karla Trilogy").
+	seenTitles := make(map[string]struct{}, len(books))
+	deduped := make([]goodreadsRow, 0, len(books))
+	for _, b := range books {
+		k := strings.ToLower(b.Title)
+		if _, seen := seenTitles[k]; seen {
+			continue
+		}
+		seenTitles[k] = struct{}{}
+		deduped = append(deduped, b)
+	}
+	books = deduped
+
 	total := len(books)
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
@@ -760,7 +804,17 @@ func runGoodreadsMode(
 			summaries[k] = s
 			order = append(order, k)
 		}
-		s.Libraries = append(s.Libraries, br.Library)
+		// Deduplicate library names.
+		alreadyHasLib := false
+		for _, l := range s.Libraries {
+			if l == br.Library {
+				alreadyHasLib = true
+				break
+			}
+		}
+		if !alreadyHasLib {
+			s.Libraries = append(s.Libraries, br.Library)
+		}
 		if br.Available {
 			s.Available = true
 		}

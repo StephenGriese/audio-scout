@@ -6,7 +6,9 @@ BIN_DIR=bin
 # Checked before checks/build so contributors can't accidentally skip it.
 HOOKS_SENTINEL=.git/hooks/.githooks-installed
 
-.PHONY: init checks staticcheck lint test build clean
+.PHONY: init checks staticcheck lint test build clean all
+
+all: build
 
 init:
 	git config core.hooksPath .githooks
