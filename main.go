@@ -550,15 +550,27 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		})
 	}
 
+	// seriesWork holds everything needed to look up one series.
+	type seriesWork struct {
+		sd                  *seriesData
+		maxRead             float64
+		readBookID          string
+		readAuthor          string
+		currentlyReadingNum float64
+	}
+
+	// First pass: resolve all CSV-resident candidates immediately (no network
+	// needed) and collect the ones that require a Goodreads page fetch.
 	var next []goodreadsRow
+	var needFetch []seriesWork
+	var mu sync.Mutex // guards next and needFetch appends
+
 	for _, sd := range seriesMap {
 		entries := sd.entries
 
-		// Find highest book number the user has read or is currently reading,
-		// plus a Goodreads ID we can use for series-page lookups.
 		var maxRead float64
 		var readBookID, readAuthor string
-		var currentlyReadingNum float64 // >0 if any book is on currently-reading shelf
+		var currentlyReadingNum float64
 		hasStarted := false
 		for _, e := range entries {
 			if e.Shelf == "read" || e.Shelf == "currently-reading" {
@@ -577,7 +589,6 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			continue
 		}
 
-		// Check if the next book is already in the CSV.
 		var csvCandidate *seriesEntry
 		for i := range entries {
 			e := &entries[i]
@@ -590,14 +601,12 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		}
 
 		if csvCandidate != nil {
-			// Skip if already read under a different series name.
 			if _, alreadyRead := readTitles[strings.ToLower(csvCandidate.Title)]; alreadyRead {
 				if verbose {
 					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — skipping %q (already read under another series)\n", sd.dispName, csvCandidate.Title)
 				}
 				continue
 			}
-			// Next book is already in Goodreads — use it directly.
 			seriesNote := "in your Goodreads"
 			if currentlyReadingNum > 0 && csvCandidate.Num == currentlyReadingNum+1 {
 				seriesNote = fmt.Sprintf("up next — currently reading #%.4g", currentlyReadingNum)
@@ -613,74 +622,97 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			continue
 		}
 
-		// Next book is NOT in the CSV — look it up on the Goodreads series page.
 		if readBookID == "" {
-			continue // no Goodreads ID available to look up
-		}
-
-		select {
-		case <-ctx.Done():
-			return next, ctx.Err()
-		default:
-		}
-
-		if verbose {
-			_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — fetching Goodreads series page...\n", sd.dispName)
-		}
-
-		var seriesBooks [][2]string
-		var err error
-		for attempt := 1; attempt <= 3; attempt++ {
-			seriesBooks, err = goodreadsSeriesPage(readBookID)
-			if err == nil {
-				break
-			}
-			if attempt < 3 {
-				backoff := time.Duration(attempt*attempt) * 5 * time.Second
-				if verbose {
-					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — attempt %d failed, retrying in %v...\n", sd.dispName, attempt, backoff)
-				}
-				time.Sleep(backoff)
-			}
-		}
-		if err != nil {
-			log.Printf("warning: series lookup for %q failed after 3 attempts: %v", sd.dispName, err)
 			continue
 		}
-
-		// Find the next whole-number book above maxRead.
-		// Optionally skip .5 books (novellas/short stories).
-		for _, pair := range seriesBooks {
-			pos, _ := strconv.ParseFloat(pair[0], 64)
-			if pos <= maxRead {
-				continue
-			}
-			// Skip novellas (e.g. #1.5, #2.5) only when --skip-novellas is set.
-			if skipNovellas && pos != float64(int(pos)) {
-				continue
-			}
-			// Skip if already read under a different series name.
-			if _, alreadyRead := readTitles[strings.ToLower(pair[1])]; alreadyRead {
-				if verbose {
-					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — skipping %q (already read under another series)\n", sd.dispName, pair[1])
-				}
-				continue
-			}
-			seriesNote := "not in your Goodreads"
-			if currentlyReadingNum > 0 && pos == currentlyReadingNum+1 {
-				seriesNote = fmt.Sprintf("up next — currently reading #%.4g", currentlyReadingNum)
-			}
-			log.Printf("series: %q — read up to #%.4g, next is #%.4g %q (not in Goodreads)",
-				sd.dispName, maxRead, pos, pair[1])
-			next = append(next, goodreadsRow{
-				Title:      pair[1],
-				Author:     readAuthor,
-				SeriesNote: seriesNote,
-				SeriesName: sd.dispName,
-			})
-			break
-		}
+		needFetch = append(needFetch, seriesWork{
+			sd:                  sd,
+			maxRead:             maxRead,
+			readBookID:          readBookID,
+			readAuthor:          readAuthor,
+			currentlyReadingNum: currentlyReadingNum,
+		})
 	}
+
+	// Second pass: fan out Goodreads series page fetches across a worker pool.
+	const seriesWorkers = 4
+	workCh := make(chan seriesWork, len(needFetch))
+	for _, w := range needFetch {
+		workCh <- w
+	}
+	close(workCh)
+
+	var wg sync.WaitGroup
+	for i := 0; i < seriesWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for w := range workCh {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if verbose {
+					_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — fetching Goodreads series page...\n", w.sd.dispName)
+				}
+
+				var seriesBooks [][2]string
+				var err error
+				for attempt := 1; attempt <= 3; attempt++ {
+					seriesBooks, err = goodreadsSeriesPage(w.readBookID)
+					if err == nil {
+						break
+					}
+					if attempt < 3 {
+						backoff := time.Duration(attempt*attempt) * 5 * time.Second
+						if verbose {
+							_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — attempt %d failed, retrying in %v...\n", w.sd.dispName, attempt, backoff)
+						}
+						time.Sleep(backoff)
+					}
+				}
+				if err != nil {
+					log.Printf("warning: series lookup for %q failed after 3 attempts: %v", w.sd.dispName, err)
+					continue
+				}
+
+				for _, pair := range seriesBooks {
+					pos, _ := strconv.ParseFloat(pair[0], 64)
+					if pos <= w.maxRead {
+						continue
+					}
+					if skipNovellas && pos != float64(int(pos)) {
+						continue
+					}
+					if _, alreadyRead := readTitles[strings.ToLower(pair[1])]; alreadyRead {
+						if verbose {
+							_, _ = fmt.Fprintf(os.Stderr, "  [series lookup] %q — skipping %q (already read under another series)\n", w.sd.dispName, pair[1])
+						}
+						continue
+					}
+					seriesNote := "not in your Goodreads"
+					if w.currentlyReadingNum > 0 && pos == w.currentlyReadingNum+1 {
+						seriesNote = fmt.Sprintf("up next — currently reading #%.4g", w.currentlyReadingNum)
+					}
+					log.Printf("series: %q — read up to #%.4g, next is #%.4g %q (not in Goodreads)",
+						w.sd.dispName, w.maxRead, pos, pair[1])
+					mu.Lock()
+					next = append(next, goodreadsRow{
+						Title:      pair[1],
+						Author:     w.readAuthor,
+						SeriesNote: seriesNote,
+						SeriesName: w.sd.dispName,
+					})
+					mu.Unlock()
+					break
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
 	return next, nil
 }
 
