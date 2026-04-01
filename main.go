@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -170,6 +171,49 @@ func getJSONWithCtx(ctx context.Context, client *http.Client, limiter <-chan str
 	return json.Unmarshal(b, out)
 }
 
+// lookupPageCount queries Google Books (then Open Library as fallback) for the
+// page count of a book by title and author. Returns 0 if not found or on error.
+func lookupPageCount(ctx context.Context, client *http.Client, limiter <-chan struct{}, title, author string) int {
+	// --- Google Books ---
+	q := "intitle:" + url.QueryEscape(title)
+	if author != "" {
+		q += "+inauthor:" + url.QueryEscape(author)
+	}
+	gbURL := fmt.Sprintf("https://www.googleapis.com/books/v1/volumes?q=%s&maxResults=3&fields=items/volumeInfo/pageCount", q)
+	var gbResp struct {
+		Items []struct {
+			VolumeInfo struct {
+				PageCount int `json:"pageCount"`
+			} `json:"volumeInfo"`
+		} `json:"items"`
+	}
+	if err := getJSONWithCtx(ctx, client, limiter, gbURL, &gbResp); err == nil {
+		for _, item := range gbResp.Items {
+			if item.VolumeInfo.PageCount > 0 {
+				return item.VolumeInfo.PageCount
+			}
+		}
+	}
+
+	// --- Open Library fallback ---
+	olURL := fmt.Sprintf("https://openlibrary.org/search.json?title=%s&fields=number_of_pages_median&limit=1",
+		url.QueryEscape(title))
+	if author != "" {
+		olURL += "&author=" + url.QueryEscape(author)
+	}
+	var olResp struct {
+		Docs []struct {
+			Pages int `json:"number_of_pages_median"`
+		} `json:"docs"`
+	}
+	if err := getJSONWithCtx(ctx, client, limiter, olURL, &olResp); err == nil {
+		if len(olResp.Docs) > 0 && olResp.Docs[0].Pages > 0 {
+			return olResp.Docs[0].Pages
+		}
+	}
+	return 0
+}
+
 // mediaDetail contains minimal fields from the media detail endpoint we need to
 // determine whether a result is an audiobook.
 type mediaDetail struct {
@@ -199,9 +243,11 @@ func parseDurationMinutes(s string) int {
 }
 
 // checkLibby returns the availability of the first audiobook result matching book at lib.
+// The returned availResponse always has DurationMinutes populated when an audiobook edition
+// was found, even if the function also returns a non-nil error (e.g. not owned by library).
 func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{}, lib Library, book BookQuery) (availResponse, error) {
 	var empty availResponse
-	// Search for several results so we can prefer audiobook-format entries.
+	// Search specifically for audiobook format so we don't waste detail lookups on ebooks.
 	searchURL := fmt.Sprintf("https://thunder.api.overdrive.com/v2/libraries/%s/media?query=%s&perPage=20", lib.Key, book.searchQuery())
 	var sr searchResponse
 	if err := getJSONWithCtx(ctx, client, limiter, searchURL, &sr); err != nil {
@@ -214,7 +260,7 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 	// Prefer an item that is an audiobook. We'll fetch each item's media detail and
 	// choose the first where mediaType == "audiobook" or one of the formats contains "audiobook".
 	// Cap at 5 detail lookups to avoid hammering the API for every search result.
-	const maxDetailLookups = 5
+	const maxDetailLookups = 20
 	var titleID string
 	var durationMinutes int
 	for i, item := range sr.Items {
@@ -251,18 +297,20 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 		}
 	}
 	// If we didn't find an audiobook edition among the returned items, fail.
+	// Return whatever duration we found (may be zero) so callers can use it.
 	if titleID == "" {
-		return empty, fmt.Errorf("no audiobook edition found in %s catalog for %q", lib.Name, book.Title)
+		return availResponse{DurationMinutes: durationMinutes},
+			fmt.Errorf("no audiobook edition found in %s catalog for %q", lib.Name, book.Title)
 	}
 
 	availURL := fmt.Sprintf("https://thunder.api.overdrive.com/v2/libraries/%s/media/%s/availability", lib.Key, titleID)
 	body2, err := doGetWithCtx(ctx, client, limiter, availURL)
 	if err != nil {
-		return empty, fmt.Errorf("availability request: %w", err)
+		return availResponse{DurationMinutes: durationMinutes}, fmt.Errorf("availability request: %w", err)
 	}
 	var av availResponse
 	if err := json.Unmarshal(body2, &av); err != nil {
-		return empty, fmt.Errorf("availability parse: %w", err)
+		return availResponse{DurationMinutes: durationMinutes}, fmt.Errorf("availability parse: %w", err)
 	}
 	av.DurationMinutes = durationMinutes
 	return av, nil
@@ -767,6 +815,7 @@ func runGoodreadsMode(
 	parallel int,
 	outJSON bool,
 	outCSV bool,
+	audibleMode bool,
 	verbose bool,
 ) {
 	// Deduplicate books by title — the same book can appear under two series
@@ -788,6 +837,13 @@ func runGoodreadsMode(
 	var wg sync.WaitGroup
 	var completed atomic.Int64
 	resCh := make(chan bookResult, total*len(libraries))
+	// missCh carries duration info for books that had no hit at a library,
+	// used to build the audible list.
+	type missResult struct {
+		Book            BookQuery
+		DurationMinutes int
+	}
+	missCh := make(chan missResult, total*len(libraries))
 
 	for _, row := range books {
 		bq := BookQuery(row)
@@ -802,13 +858,20 @@ func runGoodreadsMode(
 				br.result.Library = l.Name
 				av, err := checkLibby(ctx, client, limiter, l, b)
 				if err != nil {
-					// Not found or no audiobook edition — silently skip.
+					// Not found or no audiobook edition — send to miss channel
+					// so audible mode can account for it.
+					if audibleMode {
+						missCh <- missResult{Book: b, DurationMinutes: av.DurationMinutes}
+					}
 					return
 				}
 				// Only report if available NOW or reservable (library owns
 				// copies but they're all checked out → holds queue open).
 				reservable := av.OwnedCopies > 0 && !av.IsAvailable
 				if !av.IsAvailable && !reservable {
+					if audibleMode {
+						missCh <- missResult{Book: b, DurationMinutes: av.DurationMinutes}
+					}
 					return
 				}
 				br.Found = true
@@ -839,7 +902,7 @@ func runGoodreadsMode(
 
 	wg.Wait()
 	close(resCh)
-
+	close(missCh)
 	// Collect hits and collapse per-library results into one row per book.
 	// A book is AVAILABLE if any library has it now; otherwise WAITLIST.
 	type bookSummary struct {
@@ -892,26 +955,17 @@ func runGoodreadsMode(
 		}
 	}
 
-	if len(summaries) == 0 {
+	if len(summaries) == 0 && !audibleMode {
 		_, _ = fmt.Fprintln(os.Stderr, "No to-read audiobooks are currently available or reservable at the specified libraries.")
 		return
 	}
 
-	if outJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		out := make([]bookSummary, 0, len(order))
-		for _, k := range order {
-			out = append(out, *summaries[k])
+	if !audibleMode {
+		// Normal output — AVAILABLE/WAITLIST only.
+		if len(summaries) == 0 {
+			_, _ = fmt.Fprintln(os.Stderr, "No to-read audiobooks are currently available or reservable at the specified libraries.")
+			return
 		}
-		_ = enc.Encode(out)
-		return
-	}
-
-	if outCSV {
-		w := csv.NewWriter(os.Stdout)
-		_ = w.Write([]string{"Status", "Title", "Series", "In Goodreads", "Author", "Duration", "Minutes", "Libraries"})
-		// Sort: AVAILABLE first, then WAITLIST; alpha by title within each group.
 		avail := make([]*bookSummary, 0, len(order))
 		wait := make([]*bookSummary, 0, len(order))
 		for _, k := range order {
@@ -922,70 +976,152 @@ func runGoodreadsMode(
 				wait = append(wait, s)
 			}
 		}
+		if outJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			out := make([]bookSummary, 0, len(order))
+			for _, k := range order {
+				out = append(out, *summaries[k])
+			}
+			_ = enc.Encode(out)
+			return
+		}
+		if outCSV {
+			w := csv.NewWriter(os.Stdout)
+			_ = w.Write([]string{"Status", "Title", "Series", "In Goodreads", "Author", "Duration", "Minutes", "Libraries"})
+			for _, s := range append(avail, wait...) {
+				status := "WAITLIST"
+				if s.Available {
+					status = "AVAILABLE"
+				}
+				toRead := ""
+				if s.SeriesNote == "in your Goodreads" {
+					toRead = "to-read"
+				}
+				durHuman, durMins := "", ""
+				if s.DurationMinutes > 0 {
+					durHuman = formatDuration(s.DurationMinutes)
+					durMins = strconv.Itoa(s.DurationMinutes)
+				}
+				_ = w.Write([]string{status, s.Title, s.SeriesName, toRead, s.Author, durHuman, durMins, strings.Join(s.Libraries, ",")})
+			}
+			w.Flush()
+			return
+		}
 		for _, s := range append(avail, wait...) {
-			status := "WAITLIST"
+			status := "WAITLIST "
 			if s.Available {
 				status = "AVAILABLE"
+			}
+			dur := ""
+			if s.DurationMinutes > 0 {
+				dur = formatDuration(s.DurationMinutes)
 			}
 			toRead := ""
 			if s.SeriesNote == "in your Goodreads" {
 				toRead = "to-read"
 			}
-			durHuman := ""
-			durMins := ""
-			if s.DurationMinutes > 0 {
-				durHuman = formatDuration(s.DurationMinutes)
-				durMins = strconv.Itoa(s.DurationMinutes)
+			fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %-10s  %s\n",
+				status, truncate(s.Title, 55), truncate(s.SeriesName, 35),
+				toRead, truncate(s.Author, 30), dur, strings.Join(s.Libraries, ","),
+			)
+		}
+		return
+	}
+
+	// --- Audible mode: output only books with zero Libby hits ---
+	type audibleEntry struct {
+		Book  BookQuery
+		Pages int
+	}
+	// Collect misses.
+	bestMiss := make(map[bookKey]*audibleEntry)
+	for mr := range missCh {
+		k := bookKey{mr.Book.Title, mr.Book.Author}
+		if _, ok := bestMiss[k]; !ok {
+			bestMiss[k] = &audibleEntry{Book: mr.Book}
+		}
+	}
+	// Only include books that had NO hit in any library.
+	seen := make(map[bookKey]struct{})
+	var audibleEntries []*audibleEntry
+	for _, row := range books {
+		k := bookKey{row.Title, row.Author}
+		if _, already := seen[k]; already {
+			continue
+		}
+		seen[k] = struct{}{}
+		if _, hasHit := summaries[k]; hasHit {
+			continue // book is available or reservable in Libby — skip
+		}
+		if e, isMiss := bestMiss[k]; isMiss {
+			audibleEntries = append(audibleEntries, e)
+		}
+	}
+
+	// For entries with no audio duration, look up page count from Open Library.
+	if verbose {
+		_, _ = fmt.Fprintf(os.Stderr, "Looking up page counts for %d audible candidates...\n", len(audibleEntries))
+	}
+	pageSem := make(chan struct{}, parallel)
+	var pageWg sync.WaitGroup
+	var pageCompleted atomic.Int64
+	for _, e := range audibleEntries {
+		pageWg.Add(1)
+		pageSem <- struct{}{}
+		go func(entry *audibleEntry) {
+			defer pageWg.Done()
+			defer func() { <-pageSem }()
+			entry.Pages = lookupPageCount(ctx, client, limiter, entry.Book.Title, entry.Book.Author)
+			n := pageCompleted.Add(1)
+			if verbose {
+				pages := "no page count found"
+				if entry.Pages > 0 {
+					pages = fmt.Sprintf("%d pages", entry.Pages)
+				}
+				_, _ = fmt.Fprintf(os.Stderr, "  [pages] %s — %s\n", truncate(entry.Book.Title, 50), pages)
+				if n%10 == 0 {
+					_, _ = fmt.Fprintf(os.Stderr, "  [progress] %d / %d page lookups done...\n", n, int64(len(audibleEntries)))
+				}
 			}
-			_ = w.Write([]string{
-				status,
-				s.Title,
-				s.SeriesName,
-				toRead,
-				s.Author,
-				durHuman,
-				durMins,
-				strings.Join(s.Libraries, ","),
-			})
+		}(e)
+	}
+	pageWg.Wait()
+	if verbose {
+		_, _ = fmt.Fprintf(os.Stderr, "Page lookups complete (%d books)\n", len(audibleEntries))
+	}
+
+	sort.Slice(audibleEntries, func(i, j int) bool {
+		return strings.ToLower(audibleEntries[i].Book.Title) < strings.ToLower(audibleEntries[j].Book.Title)
+	})
+
+	if len(audibleEntries) == 0 {
+		_, _ = fmt.Fprintln(os.Stderr, "No unavailable audiobooks found for Audible list.")
+		return
+	}
+
+	if outCSV {
+		w := csv.NewWriter(os.Stdout)
+		_ = w.Write([]string{"Title", "Series", "Author", "Pages"})
+		for _, e := range audibleEntries {
+			pages := ""
+			if e.Pages > 0 {
+				pages = strconv.Itoa(e.Pages)
+			}
+			_ = w.Write([]string{e.Book.Title, e.Book.SeriesName, e.Book.Author, pages})
 		}
 		w.Flush()
 		return
 	}
 
-	// Sort: AVAILABLE first, then WAITLIST; alphabetical by title within each group.
-	avail := make([]*bookSummary, 0, len(order))
-	wait := make([]*bookSummary, 0, len(order))
-	for _, k := range order {
-		s := summaries[k]
-		if s.Available {
-			avail = append(avail, s)
-		} else {
-			wait = append(wait, s)
+	for _, e := range audibleEntries {
+		size := ""
+		if e.Pages > 0 {
+			size = fmt.Sprintf("%d pages", e.Pages)
 		}
-	}
-
-	for _, s := range append(avail, wait...) {
-		status := "WAITLIST "
-		if s.Available {
-			status = "AVAILABLE"
-		}
-		libs := strings.Join(s.Libraries, ",")
-		toRead := ""
-		if s.SeriesNote == "in your Goodreads" {
-			toRead = "to-read"
-		}
-		dur := ""
-		if s.DurationMinutes > 0 {
-			dur = formatDuration(s.DurationMinutes)
-		}
-		fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %-10s  %s\n",
-			status,
-			truncate(s.Title, 55),
-			truncate(s.SeriesName, 35),
-			toRead,
-			truncate(s.Author, 30),
-			dur,
-			libs,
+		fmt.Printf("%-55s  %-35s  %-30s  %s\n",
+			truncate(e.Book.Title, 55), truncate(e.Book.SeriesName, 35),
+			truncate(e.Book.Author, 30), size,
 		)
 	}
 }
@@ -1023,6 +1159,7 @@ func main() {
 	libs := flag.String("libs", "pittsburgh,chester,freelibrary", "Comma-separated library keys (thunder API keys)")
 	outJSON := flag.Bool("json", false, "Output results as JSON")
 	outCSV := flag.Bool("csv", false, "Output results as CSV (suitable for import into Google Sheets)")
+	audible := flag.Bool("audible", false, "Output books unavailable in any library, sorted longest first (for best Audible credit value)")
 	timeoutSec := flag.Int("timeout", 15, "Per-request timeout in seconds")
 	parallel := flag.Int("parallel", 8, "Number of concurrent requests")
 	ratePerSec := flag.Int("rate", 20, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
@@ -1066,7 +1203,7 @@ func main() {
 			if *verbose {
 				_, _ = fmt.Fprintf(os.Stderr, "Found %d next-in-series books to check\n", len(books))
 			}
-			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *verbose)
+			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *audible, *verbose)
 			return
 		}
 		books, err := parseGoodreadsToRead(*goodreadsFile)
@@ -1076,7 +1213,7 @@ func main() {
 		if *verbose {
 			_, _ = fmt.Fprintf(os.Stderr, "Found %d to-read books in %s\n", len(books), *goodreadsFile)
 		}
-		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *verbose)
+		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *audible, *verbose)
 		return
 	}
 
