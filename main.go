@@ -55,6 +55,7 @@ type availResponse struct {
 	AvailableCopies int  `json:"availableCopies"`
 	OwnedCopies     int  `json:"ownedCopies"`
 	HoldsCount      int  `json:"holdsCount"`
+	DurationMinutes int  `json:"durationMinutes"` // populated from media detail, not the availability endpoint
 }
 
 // result is a structured result we can print or JSON encode.
@@ -65,6 +66,7 @@ type result struct {
 	Owned           int    `json:"ownedCopies"`
 	AvailableCopies int    `json:"availableCopies"`
 	Holds           int    `json:"holdsCount"`
+	DurationMinutes int    `json:"durationMinutes,omitempty"`
 	Error           string `json:"error,omitempty"`
 }
 
@@ -173,8 +175,27 @@ func getJSONWithCtx(ctx context.Context, client *http.Client, limiter <-chan str
 type mediaDetail struct {
 	MediaType string `json:"mediaType"`
 	Formats   []struct {
-		ID string `json:"id"`
+		ID       string `json:"id"`
+		Duration string `json:"duration"` // "HH:MM:SS" — present on audiobook formats
 	} `json:"formats"`
+}
+
+// parseDurationMinutes converts a "HH:MM:SS" string to total minutes (rounded down).
+// Returns 0 if the string is empty or unparseable.
+func parseDurationMinutes(s string) int {
+	if s == "" {
+		return 0
+	}
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) != 3 {
+		return 0
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	return h*60 + m
 }
 
 // checkLibby returns the availability of the first audiobook result matching book at lib.
@@ -195,6 +216,7 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 	// Cap at 5 detail lookups to avoid hammering the API for every search result.
 	const maxDetailLookups = 5
 	var titleID string
+	var durationMinutes int
 	for i, item := range sr.Items {
 		if i >= maxDetailLookups {
 			break
@@ -207,11 +229,20 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 		}
 		if strings.EqualFold(md.MediaType, "audiobook") {
 			titleID = item.ID
+			for _, f := range md.Formats {
+				if d := parseDurationMinutes(f.Duration); d > 0 {
+					durationMinutes = d
+					break
+				}
+			}
 			break
 		}
 		for _, f := range md.Formats {
 			if strings.Contains(strings.ToLower(f.ID), "audiobook") {
 				titleID = item.ID
+				if d := parseDurationMinutes(f.Duration); d > 0 {
+					durationMinutes = d
+				}
 				break
 			}
 		}
@@ -233,6 +264,7 @@ func checkLibby(ctx context.Context, client *http.Client, limiter <-chan struct{
 	if err := json.Unmarshal(body2, &av); err != nil {
 		return empty, fmt.Errorf("availability parse: %w", err)
 	}
+	av.DurationMinutes = durationMinutes
 	return av, nil
 }
 
@@ -734,6 +766,7 @@ func runGoodreadsMode(
 	libraries []Library,
 	parallel int,
 	outJSON bool,
+	outCSV bool,
 	verbose bool,
 ) {
 	// Deduplicate books by title — the same book can appear under two series
@@ -783,6 +816,7 @@ func runGoodreadsMode(
 				br.Owned = av.OwnedCopies
 				br.AvailableCopies = av.AvailableCopies
 				br.Holds = av.HoldsCount
+				br.DurationMinutes = av.DurationMinutes
 				resCh <- br
 				if verbose {
 					status := "WAITLIST"
@@ -809,13 +843,14 @@ func runGoodreadsMode(
 	// Collect hits and collapse per-library results into one row per book.
 	// A book is AVAILABLE if any library has it now; otherwise WAITLIST.
 	type bookSummary struct {
-		Title      string
-		Author     string
-		Available  bool
-		DaysOnList int
-		SeriesNote string
-		SeriesName string
-		Libraries  []string
+		Title           string
+		Author          string
+		Available       bool
+		DaysOnList      int
+		SeriesNote      string
+		SeriesName      string
+		Libraries       []string
+		DurationMinutes int
 	}
 	type bookKey struct{ Title, Author string }
 	summaries := make(map[bookKey]*bookSummary)
@@ -827,11 +862,12 @@ func runGoodreadsMode(
 		s, exists := summaries[k]
 		if !exists {
 			s = &bookSummary{
-				Title:      br.Book.Title,
-				Author:     br.Book.Author,
-				DaysOnList: br.Book.DaysOnList,
-				SeriesNote: br.Book.SeriesNote,
-				SeriesName: br.Book.SeriesName,
+				Title:           br.Book.Title,
+				Author:          br.Book.Author,
+				DaysOnList:      br.Book.DaysOnList,
+				SeriesNote:      br.Book.SeriesNote,
+				SeriesName:      br.Book.SeriesName,
+				DurationMinutes: br.DurationMinutes,
 			}
 			summaries[k] = s
 			order = append(order, k)
@@ -850,6 +886,10 @@ func runGoodreadsMode(
 		if br.Available {
 			s.Available = true
 		}
+		// Keep the first non-zero duration we see across libraries.
+		if s.DurationMinutes == 0 && br.DurationMinutes > 0 {
+			s.DurationMinutes = br.DurationMinutes
+		}
 	}
 
 	if len(summaries) == 0 {
@@ -865,6 +905,50 @@ func runGoodreadsMode(
 			out = append(out, *summaries[k])
 		}
 		_ = enc.Encode(out)
+		return
+	}
+
+	if outCSV {
+		w := csv.NewWriter(os.Stdout)
+		_ = w.Write([]string{"Status", "Title", "Series", "In Goodreads", "Author", "Duration", "Minutes", "Libraries"})
+		// Sort: AVAILABLE first, then WAITLIST; alpha by title within each group.
+		avail := make([]*bookSummary, 0, len(order))
+		wait := make([]*bookSummary, 0, len(order))
+		for _, k := range order {
+			s := summaries[k]
+			if s.Available {
+				avail = append(avail, s)
+			} else {
+				wait = append(wait, s)
+			}
+		}
+		for _, s := range append(avail, wait...) {
+			status := "WAITLIST"
+			if s.Available {
+				status = "AVAILABLE"
+			}
+			toRead := ""
+			if s.SeriesNote == "in your Goodreads" {
+				toRead = "to-read"
+			}
+			durHuman := ""
+			durMins := ""
+			if s.DurationMinutes > 0 {
+				durHuman = formatDuration(s.DurationMinutes)
+				durMins = strconv.Itoa(s.DurationMinutes)
+			}
+			_ = w.Write([]string{
+				status,
+				s.Title,
+				s.SeriesName,
+				toRead,
+				s.Author,
+				durHuman,
+				durMins,
+				strings.Join(s.Libraries, ","),
+			})
+		}
+		w.Flush()
 		return
 	}
 
@@ -890,12 +974,17 @@ func runGoodreadsMode(
 		if s.SeriesNote == "in your Goodreads" {
 			toRead = "to-read"
 		}
-		fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %s\n",
+		dur := ""
+		if s.DurationMinutes > 0 {
+			dur = formatDuration(s.DurationMinutes)
+		}
+		fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %-10s  %s\n",
 			status,
 			truncate(s.Title, 55),
 			truncate(s.SeriesName, 35),
 			toRead,
 			truncate(s.Author, 30),
+			dur,
 			libs,
 		)
 	}
@@ -910,12 +999,30 @@ func truncate(s string, n int) string {
 	return string(runes[:n-1]) + "…"
 }
 
+// formatDuration converts a duration in minutes to a human-readable string
+// like "12h 34m". Returns an empty string for zero.
+func formatDuration(minutes int) string {
+	if minutes <= 0 {
+		return ""
+	}
+	h := minutes / 60
+	m := minutes % 60
+	if h == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh %dm", h, m)
+}
+
 func main() {
 	// Flags
 	title := flag.String("title", "Lore", "Book title to search for")
 	author := flag.String("author", "Alexandra Bracken", "Author (optional)")
 	libs := flag.String("libs", "pittsburgh,chester,freelibrary", "Comma-separated library keys (thunder API keys)")
 	outJSON := flag.Bool("json", false, "Output results as JSON")
+	outCSV := flag.Bool("csv", false, "Output results as CSV (suitable for import into Google Sheets)")
 	timeoutSec := flag.Int("timeout", 15, "Per-request timeout in seconds")
 	parallel := flag.Int("parallel", 8, "Number of concurrent requests")
 	ratePerSec := flag.Int("rate", 20, "Maximum HTTP requests per second (rate limit toward the Thunder API)")
@@ -959,7 +1066,7 @@ func main() {
 			if *verbose {
 				_, _ = fmt.Fprintf(os.Stderr, "Found %d next-in-series books to check\n", len(books))
 			}
-			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *verbose)
+			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *verbose)
 			return
 		}
 		books, err := parseGoodreadsToRead(*goodreadsFile)
@@ -969,7 +1076,7 @@ func main() {
 		if *verbose {
 			_, _ = fmt.Fprintf(os.Stderr, "Found %d to-read books in %s\n", len(books), *goodreadsFile)
 		}
-		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *verbose)
+		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *verbose)
 		return
 	}
 
