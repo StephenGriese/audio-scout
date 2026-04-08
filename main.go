@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -100,7 +101,7 @@ func newRateLimiter(rps int) (tokens <-chan struct{}, stop chan struct{}) {
 func doGetWithCtx(ctx context.Context, client *http.Client, limiter <-chan struct{}, u string) ([]byte, error) {
 	var lastErr error
 	// simple retry loop
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range 3 {
 		// Wait for a rate-limit token before firing the request.
 		select {
 		case <-ctx.Done():
@@ -723,10 +724,8 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 	close(workCh)
 
 	var wg sync.WaitGroup
-	for i := 0; i < seriesWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range seriesWorkers {
+		wg.Go(func() {
 			for w := range workCh {
 				select {
 				case <-ctx.Done():
@@ -789,7 +788,7 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 					break
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -936,13 +935,7 @@ func runGoodreadsMode(
 			order = append(order, k)
 		}
 		// Deduplicate library names.
-		alreadyHasLib := false
-		for _, l := range s.Libraries {
-			if l == br.Library {
-				alreadyHasLib = true
-				break
-			}
-		}
+		alreadyHasLib := slices.Contains(s.Libraries, br.Library)
 		if !alreadyHasLib {
 			s.Libraries = append(s.Libraries, br.Library)
 		}
