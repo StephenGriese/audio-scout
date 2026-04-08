@@ -94,29 +94,49 @@ series: "Kingkiller Chronicle" — read up to #2, next is #3 "The Doors of Stone
 | `--author` | `"Alexandra Bracken"` | Author name (single-book mode, optional) |
 | `--libs` | `pittsburgh,chester,freelibrary` | Comma-separated library keys |
 | `--goodreads` | _(none)_ | Path to a Goodreads CSV export; checks all to-read books |
-| `--series` | `false` | Check next-in-series audiobook availability for series you have started (requires `--goodreads`) |
+| `--series` | `false` | Check next-in-series audiobook availability for series you have started (requires --goodreads) |
 | `--rate` | `20` | Max HTTP requests per second toward the Thunder API |
 | `--parallel` | `8` | Number of concurrent worker goroutines |
 | `--timeout` | `15` | Per-request HTTP timeout in seconds |
+| `--audible` | `false` | Output books that are **not** available or reservable in Libby (for Audible credit planning) |
+| `--csv` | `false` | Emit results as CSV (suitable for import into Google Sheets) |
 | `--json` | `false` | Emit results as JSON instead of plain text |
+| `--skip-novellas` | `false` | In series mode, skip novellas and short stories (non-integer positions like #1.5) |
 | `--verbose` | `false` | Print progress and hits to stderr while running |
 
 ## Output
 
-By default, output is plain columnar text — one line per book — designed to be piped:
+### Default (Libby availability)
+
+Plain columnar text — one line per book — designed to be piped:
 
 ```
-AVAILABLE  Dinner for Vampires                          Wil Wheaton                      312d  pittsburgh,freelibrary
-AVAILABLE  The Nightingale                              Kristin Hannah                   891d  chester
-WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent                  1204d  pittsburgh,chester,freelibrary
-WAITLIST   Watership Down                               Richard Adams                     47d  chester
+AVAILABLE  Dinner for Vampires                          Wil Wheaton          312d  10h 30m  pittsburgh,freelibrary
+AVAILABLE  The Nightingale                              Kristin Hannah       891d  15h 12m  chester
+WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent      1204d   9h 45m  pittsburgh,chester,freelibrary
+WAITLIST   Watership Down                               Richard Adams         47d           chester
 ```
 
 - **`AVAILABLE`** — at least one library has a copy ready to borrow right now
 - **`WAITLIST`** — every library that owns it has all copies checked out; you can place a hold
 - **`312d`** — days the book has been on your to-read list (from Goodreads `Date Added`); useful for prioritising long-neglected titles
+- **`10h 30m`** — audiobook duration from the Libby catalog (blank if unavailable)
 - Libraries are collapsed into a single comma-separated column per book — if multiple libraries have it, they all appear on one line
 - Results are sorted: `AVAILABLE` first, then `WAITLIST`
+
+### Audible mode (`--audible`)
+
+Books that are **not** available or reservable at any of your libraries — useful for deciding which titles are worth spending an Audible credit on:
+
+```
+Absalom, Absalom!                        William Faulkner              324 pages
+Blood Meridian                           Cormac McCarthy               352 pages
+The Pillars of the Earth                 Ken Follett                   983 pages
+```
+
+- **Pages** are fetched from Google Books (with Open Library as fallback) so you can sort by book length and get the best value from your Audible credits
+- Page count is blank if neither source returns a result
+- Use `--csv` to import into Google Sheets and sort by the Pages column
 
 The tool is silent if there are no results — no output at all, exit 0.
 
@@ -160,7 +180,7 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 
 ## Rate limiting
 
-The Thunder API is public and unauthenticated. The default `--rate 5` (5 requests/second) is conservative and polite. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **3–4 minutes** at this rate.
+The Thunder API is public and unauthenticated. The default `--rate 20` (20 requests/second) works well in practice. A full Goodreads to-read list of ~750 books across 3 libraries takes roughly **3–5 minutes** at this rate.
 
 If the Thunder API rate-limits you, a warning is printed to **stderr**:
 
