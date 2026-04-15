@@ -402,7 +402,8 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 			continue
 		}
 		allRows = append(allRows, rawRow{title, author, shelf, dateAdded})
-		if shelf == "read" {
+		shelfLower := strings.ToLower(shelf)
+		if shelfLower == "read" {
 			key := strings.ToLower(title) + "\x00" + strings.ToLower(author)
 			alreadyRead[key] = struct{}{}
 		}
@@ -413,7 +414,7 @@ func parseGoodreadsToRead(path string) ([]goodreadsRow, error) {
 	seen := make(map[string]struct{})
 	var books []goodreadsRow
 	for _, row := range allRows {
-		if row.shelf != "to-read" {
+		if strings.ToLower(row.shelf) != "to-read" {
 			continue
 		}
 		key := strings.ToLower(row.title) + "\x00" + strings.ToLower(row.author)
@@ -594,9 +595,10 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		}
 		rawTitle := strings.TrimSpace(rec[titleIdx])
 		shelf := strings.TrimSpace(rec[shelfIdx])
+		shelfLower := strings.ToLower(shelf)
 
 		// Track every read title globally, even books not in a series.
-		if shelf == "read" {
+		if shelfLower == "read" {
 			readTitles[strings.ToLower(strings.TrimSpace(rawTitle))] = struct{}{}
 		}
 
@@ -614,7 +616,7 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 		}
 
 		// Also index the clean title for cross-series read checking.
-		if shelf == "read" {
+		if shelfLower == "read" {
 			readTitles[strings.ToLower(cleanTitle)] = struct{}{}
 		}
 
@@ -627,7 +629,7 @@ func parseSeriesNextBooks(ctx context.Context, path string, verbose bool, skipNo
 			Num:         num,
 			Title:       cleanTitle,
 			Author:      author,
-			Shelf:       shelf,
+			Shelf:       shelfLower,
 		})
 	}
 
@@ -814,6 +816,7 @@ func runGoodreadsMode(
 	parallel int,
 	outJSON bool,
 	outCSV bool,
+	seriesMode bool,
 	audibleMode bool,
 	verbose bool,
 ) {
@@ -981,22 +984,34 @@ func runGoodreadsMode(
 		}
 		if outCSV {
 			w := csv.NewWriter(os.Stdout)
-			_ = w.Write([]string{"Status", "Title", "Series", "In Goodreads", "Author", "Duration", "Minutes", "Libraries"})
+			if seriesMode {
+				_ = w.Write([]string{"Status", "Title", "Series", "In Goodreads", "Author", "Duration", "Minutes", "Libraries"})
+			} else {
+				_ = w.Write([]string{"Status", "Title", "Author", "Days", "Duration", "Minutes", "Libraries"})
+			}
 			for _, s := range append(avail, wait...) {
 				status := "WAITLIST"
 				if s.Available {
 					status = "AVAILABLE"
-				}
-				toRead := ""
-				if s.SeriesNote == "in your Goodreads" {
-					toRead = "to-read"
 				}
 				durHuman, durMins := "", ""
 				if s.DurationMinutes > 0 {
 					durHuman = formatDuration(s.DurationMinutes)
 					durMins = strconv.Itoa(s.DurationMinutes)
 				}
-				_ = w.Write([]string{status, s.Title, s.SeriesName, toRead, s.Author, durHuman, durMins, strings.Join(s.Libraries, ",")})
+				if seriesMode {
+					toRead := ""
+					if s.SeriesNote == "in your Goodreads" {
+						toRead = "to-read"
+					}
+					_ = w.Write([]string{status, s.Title, s.SeriesName, toRead, s.Author, durHuman, durMins, strings.Join(s.Libraries, ",")})
+				} else {
+					days := ""
+					if s.DaysOnList > 0 {
+						days = strconv.Itoa(s.DaysOnList)
+					}
+					_ = w.Write([]string{status, s.Title, s.Author, days, durHuman, durMins, strings.Join(s.Libraries, ",")})
+				}
 			}
 			w.Flush()
 			return
@@ -1010,14 +1025,25 @@ func runGoodreadsMode(
 			if s.DurationMinutes > 0 {
 				dur = formatDuration(s.DurationMinutes)
 			}
-			toRead := ""
-			if s.SeriesNote == "in your Goodreads" {
-				toRead = "to-read"
+			if seriesMode {
+				toRead := ""
+				if s.SeriesNote == "in your Goodreads" {
+					toRead = "to-read"
+				}
+				fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %-10s  %s\n",
+					status, truncate(s.Title, 55), truncate(s.SeriesName, 35),
+					toRead, truncate(s.Author, 30), dur, strings.Join(s.Libraries, ","),
+				)
+			} else {
+				days := ""
+				if s.DaysOnList > 0 {
+					days = fmt.Sprintf("%dd", s.DaysOnList)
+				}
+				fmt.Printf("%-9s  %-55s  %-30s  %-6s  %-10s  %s\n",
+					status, truncate(s.Title, 55), truncate(s.Author, 30),
+					days, dur, strings.Join(s.Libraries, ","),
+				)
 			}
-			fmt.Printf("%-9s  %-55s  %-35s  %-9s  %-30s  %-10s  %s\n",
-				status, truncate(s.Title, 55), truncate(s.SeriesName, 35),
-				toRead, truncate(s.Author, 30), dur, strings.Join(s.Libraries, ","),
-			)
 		}
 		return
 	}
@@ -1095,13 +1121,13 @@ func runGoodreadsMode(
 
 	if outCSV {
 		w := csv.NewWriter(os.Stdout)
-		_ = w.Write([]string{"Title", "Series", "Author", "Pages"})
+		_ = w.Write([]string{"Title", "Author", "Pages"})
 		for _, e := range audibleEntries {
 			pages := ""
 			if e.Pages > 0 {
 				pages = strconv.Itoa(e.Pages)
 			}
-			_ = w.Write([]string{e.Book.Title, e.Book.SeriesName, e.Book.Author, pages})
+			_ = w.Write([]string{e.Book.Title, e.Book.Author, pages})
 		}
 		w.Flush()
 		return
@@ -1112,9 +1138,8 @@ func runGoodreadsMode(
 		if e.Pages > 0 {
 			size = fmt.Sprintf("%d pages", e.Pages)
 		}
-		fmt.Printf("%-55s  %-35s  %-30s  %s\n",
-			truncate(e.Book.Title, 55), truncate(e.Book.SeriesName, 35),
-			truncate(e.Book.Author, 30), size,
+		fmt.Printf("%-55s  %-30s  %s\n",
+			truncate(e.Book.Title, 55), truncate(e.Book.Author, 30), size,
 		)
 	}
 }
@@ -1196,7 +1221,7 @@ func main() {
 			if *verbose {
 				_, _ = fmt.Fprintf(os.Stderr, "Found %d next-in-series books to check\n", len(books))
 			}
-			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *audible, *verbose)
+			runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, true, *audible, *verbose)
 			return
 		}
 		books, err := parseGoodreadsToRead(*goodreadsFile)
@@ -1206,7 +1231,7 @@ func main() {
 		if *verbose {
 			_, _ = fmt.Fprintf(os.Stderr, "Found %d to-read books in %s\n", len(books), *goodreadsFile)
 		}
-		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, *audible, *verbose)
+		runGoodreadsMode(ctx, client, limiter, books, libraries, *parallel, *outJSON, *outCSV, false, *audible, *verbose)
 		return
 	}
 

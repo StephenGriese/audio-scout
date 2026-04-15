@@ -48,7 +48,7 @@ Alternatively, open [libbyapp.com](https://libbyapp.com) in your browser, sign i
 
 ### Check your entire Goodreads to-read list
 
-Export your library from Goodreads (**My Books → Import and Export → Export Library**), then:
+Export your library from Goodreads (**My Books -> Import and Export -> Export Library**), then:
 
 ```bash
 time ./bin/audio-scout \
@@ -58,7 +58,8 @@ time ./bin/audio-scout \
   --parallel 8 \
   --timeout 15 \
   --verbose \
-  > available.txt
+  > run/available.txt \
+  2> >(tee run/errors.txt)
 ```
 
 Only books on your **to-read** shelf are checked. Books with no audiobook edition, or where the library doesn't own a copy, produce no output. Progress and any warnings stream to stderr so you can watch the run while stdout goes cleanly to the file. Prepending `time` gives you a wall-clock summary when it finishes.
@@ -108,7 +109,7 @@ series: "Kingkiller Chronicle" — read up to #2, next is #3 "The Doors of Stone
 
 ### Default (Libby availability)
 
-Plain columnar text — one line per book — designed to be piped:
+Plain columnar text - one line per book - designed to be piped:
 
 ```
 AVAILABLE  Dinner for Vampires                          Wil Wheaton          312d  10h 30m  pittsburgh,freelibrary
@@ -117,12 +118,24 @@ WAITLIST   1929: Inside the Greatest Crash in History…  Lionel Laurent      12
 WAITLIST   Watership Down                               Richard Adams         47d           chester
 ```
 
-- **`AVAILABLE`** — at least one library has a copy ready to borrow right now
-- **`WAITLIST`** — every library that owns it has all copies checked out; you can place a hold
-- **`312d`** — days the book has been on your to-read list (from Goodreads `Date Added`); useful for prioritising long-neglected titles
-- **`10h 30m`** — audiobook duration from the Libby catalog (blank if unavailable)
-- Libraries are collapsed into a single comma-separated column per book — if multiple libraries have it, they all appear on one line
+- **`AVAILABLE`** - at least one library has a copy ready to borrow right now
+- **`WAITLIST`** - every library that owns it has all copies checked out; you can place a hold
+- **`312d`** - days the book has been on your to-read list (from Goodreads `Date Added`); useful for prioritising long-neglected titles
+- **`10h 30m`** - audiobook duration from the Libby catalog (blank if unavailable)
+- Libraries are collapsed into a single comma-separated column per book - if multiple libraries have it, they all appear on one line
 - Results are sorted: `AVAILABLE` first, then `WAITLIST`
+
+When you add `--csv` (without `--series` or `--audible`), the headers are:
+
+```
+Status,Title,Author,Days,Duration,Minutes,Libraries
+```
+
+In series mode (`--series --csv`), headers are:
+
+```
+Status,Title,Series,In Goodreads,Author,Duration,Minutes,Libraries
+```
 
 ### Audible mode (`--audible`)
 
@@ -138,6 +151,12 @@ The Pillars of the Earth                 Ken Follett                   983 pages
 - Page count is blank if neither source returns a result
 - Use `--csv` to import into Google Sheets and sort by the Pages column
 
+When you add `--audible --csv`, the headers are:
+
+```
+Title,Author,Pages
+```
+
 The tool is silent if there are no results — no output at all, exit 0.
 
 ### stderr vs stdout
@@ -145,9 +164,9 @@ The tool is silent if there are no results — no output at all, exit 0.
 Progress output (`--verbose`) and error messages go to **stderr**. Results go to **stdout**. These are separate streams, so you can redirect results to a file while still watching progress in your terminal:
 
 ```bash
-./bin/audio-scout --goodreads export.csv --verbose > results.txt
+./bin/audio-scout --goodreads export.csv --verbose > run/results.txt
 # stderr (progress) prints to your terminal
-# stdout (results) goes to results.txt
+# stdout (results) goes to run/results.txt
 ```
 
 This means `--verbose` never pollutes a pipe or redirect — it's safe to always use it for long-running scans.
@@ -175,7 +194,7 @@ This means `--verbose` never pollutes a pipe or redirect — it's safe to always
 ./bin/audio-scout --goodreads export.csv --json | jq '.[] | select(.Available) | .Title'
 
 # Save results to a file; hits and progress stream to stderr so you can watch
-./bin/audio-scout --goodreads export.csv --verbose > results.txt
+./bin/audio-scout --goodreads export.csv --verbose > run/results.txt
 ```
 
 ## Rate limiting
