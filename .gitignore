@@ -25,6 +25,9 @@ scorpio
 # Run output files in root
 run-*
 
+# Run directory
+/run
+
 # Environment config files
 /.env*
 
